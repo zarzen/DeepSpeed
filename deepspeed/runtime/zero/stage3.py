@@ -8,6 +8,7 @@ import os
 from collections import defaultdict, OrderedDict
 import itertools
 import torch
+from torch.cuda import nvtx
 from torch.distributed.distributed_c10d import _get_global_rank
 import torch.distributed as dist
 import math
@@ -351,7 +352,7 @@ class PartitionedParameterCoordinator(object):
                 sub_module,
                 numel=numel)
 
-            self._all_gather(params_to_prefetch, async_op=True)
+            self._all_gather(params_to_prefetch, async_op=False)
             for param in params_to_prefetch:
                 param.ds_status = ZeroParamStatus.INFLIGHT
 
@@ -432,18 +433,21 @@ class PartitionedParameterCoordinator(object):
         self.hierarchy += 1
 
         # parameters are partitioned and need to be allgathered
-        self._all_gather(partitioned_params, async_op=True)
+        # self._all_gather(partitioned_params, async_op=True)
+        self._all_gather(partitioned_params, async_op=False)
 
         # parameters are inflight and communication needs to be completed
         if partitioned_params or params_in_flight:
             self._synchronize_communication()
 
+        nvtx.range_push('change availability')
         for _, param in sub_module.named_parameters(recurse=False):
             param.ds_status = ZeroParamStatus.AVAILABLE
-            print_rank_0(
-                f"Param id {param.ds_id}, Shape {param.shape}, device {param.device} norm {param.norm()}",
-                force=False)
+            # print_rank_0(
+            #     f"Param id {param.ds_id}, Shape {param.shape}, device {param.device} norm {param.norm()}",
+            #     force=False)
         #print_rank_0(f"After fetching (id, shape, device): {[(param.ds_id, param.shape, param.device) for param in sub_module.named_parameters(recurse=False)]}")
+        nvtx.range_pop()
 
     def release_sub_module(self, sub_module):
         self.hierarchy -= 1
@@ -519,6 +523,7 @@ class PartitionedParameterCoordinator(object):
             self.params_in_flight.extend(partitioned_params)
 
     def _synchronize_communication(self, synchronize_streams=True):
+        nvtx.range_push(f'_synchronize_communication')
         assert len(self.params_in_flight) == len(self.in_flight_handles)
         for handle, param in zip(self.in_flight_handles, self.params_in_flight):
             if handle is not None:
@@ -529,6 +534,7 @@ class PartitionedParameterCoordinator(object):
         torch.cuda.synchronize() if synchronize_streams else None
         self.in_flight_handles = []
         self.params_in_flight = []
+        nvtx.range_pop()
 
 
 class PreBackwardFunction(torch.autograd.Function):
@@ -1410,9 +1416,12 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
             self._register_hooks_recursively(child, count=count)
 
         def _pre_forward_module_hook(module, *args):
+            nvtx.range_push("_pre_forward_module_hook")
             self.pre_sub_module_forward_function(module)
+            nvtx.range_pop()
 
         def _post_forward_module_hook(module, input, output):
+            nvtx.range_push("_post_forward_module_hook")
             global FWD_MODULE_STACK
             FWD_MODULE_STACK.pop()
             if output is None:
@@ -1451,11 +1460,15 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
 
             self.post_sub_module_forward_function(module)
 
+            nvtx.range_pop()
+
         def _pre_backward_module_hook(module, inputs, output):
             def _run_before_backward_function(sub_module):
+                nvtx.range_push("_run_before_backward_function")
                 if sub_module.applied_pre_backward is False:
                     self.pre_sub_module_backward_function(sub_module)
                     sub_module.applied_pre_backward = True
+                nvtx.range_pop()
 
             return _apply_to_tensors_only(module,
                                           PreBackwardFunction,
@@ -1489,8 +1502,10 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
             module.ds_grads_remaining = 0
 
             def _run_after_backward_function(sub_module):
+                nvtx.range_push("_run_after_backward_function")
                 if sub_module.ds_grads_remaining == 0:
                     self.post_sub_module_backward_function(sub_module)
+                nvtx.range_pop()
 
             return _apply_to_tensors_only(module,
                                           PostBackwardFunction,
@@ -1517,11 +1532,14 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
 
         self.param_coordinator.record_trace(sub_module)
 
+        nvtx.range_push('fetch_sub_module')
         self.param_coordinator.fetch_sub_module(sub_module)
         see_memory_usage(
             f"Before sub module function {sub_module.__class__.__name__} after fetch",
             force=False)
+        nvtx.range_pop()
 
+        nvtx.range_push('prefetch_next_sub_modules')
         self.param_coordinator.prefetch_next_sub_modules(
             sub_module,
             numel=self.prefetch_elements,
@@ -1529,6 +1547,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
         see_memory_usage(
             f"Before sub module function {sub_module.__class__.__name__} after prefetch",
             force=False)
+        nvtx.range_pop()
 
         self.param_coordinator.increment_step(sub_module)
 
@@ -1947,6 +1966,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
         return tensor
 
     def average_tensor(self, tensors, params_to_reduce):
+        nvtx.range_push('average_tensor')
         with torch.cuda.stream(self.reduction_stream):
             if not self.reduce_scatter:
                 for tensor in tensors:
@@ -1964,6 +1984,8 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
             params_to_reduce[0].reduce_gradients_at_owner(
                 param_list=params_to_reduce,
                 hierarchy=self.param_coordinator.hierarchy)
+
+        nvtx.range_pop()
 
     def set_grad_positions(self):
         for i, group in enumerate(self.fp16_groups):

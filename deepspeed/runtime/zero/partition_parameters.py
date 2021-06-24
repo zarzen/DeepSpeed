@@ -3,6 +3,7 @@
 Licensed under the MIT license.
 """
 
+from logging import debug
 import os
 import time
 import types
@@ -11,6 +12,7 @@ import functools
 import itertools
 
 import torch
+from torch.cuda import nvtx
 from torch.distributed.distributed_c10d import _get_global_rank
 
 from .linear import LinearModuleForZeroStage3, LinearFunctionForZeroStage3
@@ -468,8 +470,9 @@ class Init(InsertPostInitMethodToModuleSubClasses):
         global param_count
         for name, param in module.named_parameters(recurse=False):
             param_count += param.numel()
+            param.ds_name = name
             if not is_zero_param(param):
-                self._convert_to_deepspeed_param(param)
+                self._convert_to_deepspeed_param(param, name)
                 print_rank_0(
                     f"Partitioning param with ds id {param.ds_id} and shape {param.data.shape}"
                 )
@@ -478,7 +481,9 @@ class Init(InsertPostInitMethodToModuleSubClasses):
             f"Param count {param_count}. After converting and partitioning parmas in {module.__class__.__name__}",
             force=False)
 
-    def _convert_to_deepspeed_param(self, param):
+    def _convert_to_deepspeed_param(self, param, name=None):
+        if name is not None:
+            param.ds_name = name
 
         # Partitioned, Normal, Remote
         param.ds_param_type = ZeroParamType.PARTITIONED
@@ -599,9 +604,17 @@ class Init(InsertPostInitMethodToModuleSubClasses):
             swap_in_list[0].nvme_swapper.swap_in(swap_in_list, async_op=False)
         elif len(swap_in_flight) > 0:
             swap_in_flight[0].nvme_swapper.synchronize_reads()
+    
+    def __get_size(self, param_list):
+        s = 0
+        for p in param_list:
+            s += p.ds_tensor.ds_numel
+        return s
 
     def _all_gather(self, param_list, async_op=False, hierarchy=None):
+        psize = self.__get_size(param_list)
 
+        nvtx.range_push(f'all-gather-{psize}-async-{async_op}')
         #fetches from nvme if the partition is not available and in nvme
         self._ensure_availability_of_partitioned_params(param_list)
 
@@ -622,8 +635,11 @@ class Init(InsertPostInitMethodToModuleSubClasses):
             ret_value = self._allgather_params(all_gather_list, hierarchy=hierarchy)
             for param in all_gather_list:
                 param.ds_status = ZeroParamStatus.AVAILABLE
+            
+            nvtx.range_pop()
             return ret_value
 
+        nvtx.range_pop()
         return handles
 
     def _partition(self, param_list, force=False, has_been_updated=False):
@@ -774,8 +790,9 @@ class Init(InsertPostInitMethodToModuleSubClasses):
             )
 
     def _allgather_param(self, param, async_op=False, hierarchy=0):
-
         partition_size = param.ds_tensor.ds_numel
+
+        nvtx.range_push(f'pre_launch_all_gather-{partition_size}')
 
         tensor_size = partition_size * self.world_size
         aligned_param_size = self._aligned_size(param)
@@ -812,7 +829,9 @@ class Init(InsertPostInitMethodToModuleSubClasses):
 
             if i == torch.distributed.get_rank(group=self.ds_process_group):
                 partitions[i].data.copy_(param.ds_tensor.data, non_blocking=True)
+        nvtx.range_pop()
 
+        nvtx.range_push('launch_all_gather')
         handle = torch.distributed.all_gather(partitions,
                                               partitions[self.rank],
                                               group=self.ds_process_group,
@@ -820,6 +839,8 @@ class Init(InsertPostInitMethodToModuleSubClasses):
 
         replicated_tensor = flat_tensor.narrow(0, 0, param.ds_numel).view(param.ds_shape)
         param.data = replicated_tensor.data
+        nvtx.range_pop()
+
         return handle
 
     def _allgather_params(self, param_list, hierarchy=0):
@@ -856,7 +877,12 @@ class Init(InsertPostInitMethodToModuleSubClasses):
                                      async_op=False)
         param_offset = 0
 
-        for param in param_list:
+        nvtx.range_push('After-all-gather-op')
+        
+        for param_idx, param in enumerate(param_list):
+            param_name = param.ds_name if hasattr(param, 'ds_name') else 'unknow name'
+            nvtx.range_push(f'copy-param-{param_name}-{param_idx}')
+
             param_partition_size = param.ds_tensor.ds_numel
             param_size = param.ds_numel
             replicated_tensor = torch.empty(param.ds_shape,
@@ -864,7 +890,7 @@ class Init(InsertPostInitMethodToModuleSubClasses):
                                             device=self.local_device)
 
             for i in range(self.world_size):
-
+                nvtx.range_push(f'copy-param{param_idx}-{i}-{param_partition_size}')
                 start = i * partition_size
 
                 param_start = i * param_partition_size
@@ -877,14 +903,20 @@ class Init(InsertPostInitMethodToModuleSubClasses):
                     replicated_tensor.view(-1).narrow(0,
                                                       param_start,
                                                       numel_to_copy).copy_(part_to_copy)
+                nvtx.range_pop()
+
             #param_offset += param.data.numel()
             param_offset += param.ds_tensor.ds_numel
 
             param.data = replicated_tensor.data
 
+            nvtx.range_pop()
+        nvtx.range_pop()
+
         return None
 
     def _reduce_scatter_gradients(self, param_list):
+        # nvtx.range_push('_reduce_scatter_gradients')
         #print_rank_0([param.grad for param in param_list])
         #assert any([param.grad is None for param in param_list]), "None gradients cannot be reduce scattered"
 
@@ -914,6 +946,7 @@ class Init(InsertPostInitMethodToModuleSubClasses):
                                                reduced_partition.narrow(0,
                                                                         0,
                                                                         elements))
+        # nvtx.range_pop()
 
     def _reduce_scatter_gradient(self, param):
 
