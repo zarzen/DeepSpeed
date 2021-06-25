@@ -13,7 +13,7 @@ import itertools
 
 import torch
 from torch.cuda import nvtx
-from torch.distributed.distributed_c10d import _get_global_rank
+from torch.distributed.distributed_c10d import _get_global_rank, _batch_p2p_manager, get_backend
 
 from .linear import LinearModuleForZeroStage3, LinearFunctionForZeroStage3
 from .offload_constants import *
@@ -889,13 +889,13 @@ class Init(InsertPostInitMethodToModuleSubClasses):
         # Wait ensures the operation is enqueued, but not necessarily complete.
         launch_handles[-1].wait()
 
-        torch.cuda.synchronize()
-
         # assign to param.data (not copy)
         for i, param in enumerate(param_list):
             gathered_tensor = allgather_params[i]
             param.data = gathered_tensor.narrow(
                 0, 0, param.ds_numel).view(param.ds_shape).data
+
+        torch.cuda.synchronize()
 
         return None
 
