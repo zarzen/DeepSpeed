@@ -8,24 +8,55 @@
 #include <nccl.h>
 #include <unordered_map>
 #include <vector>
+#include <cstring>
+#include <cstdlib>
+
+int debug_flag = std::getenv("DS_DEBUG")? std::stoi(std::getenv("DS_DEBUG")): 0;
 
 // recording created ncclComm_t
 // using processGroup Name as key
 std::unordered_map<std::string, ncclComm_t> group_communicators;
 
-void check_tensors(std::vector<at::Tensor>& outputTensors,
-                    std::vector<at::Tensor>& inputTensors,
+// NCCL type typing 
+// copied from pytorch source code
+std::map<at::ScalarType, ncclDataType_t> ncclDataType = {
+    {at::kChar, ncclInt8},
+    {at::kByte, ncclUint8},
+    {at::kFloat, ncclFloat},
+    {at::kDouble, ncclDouble},
+    {at::kInt, ncclInt32},
+    {at::kLong, ncclInt64},
+    {at::kHalf, ncclHalf},
+    {at::kBool, ncclUint8},
+#if defined(__HIP_PLATFORM_HCC__) && HIP_VERSION >= 301
+    {at::kBFloat16, ncclBfloat16},
+#endif
+};
+
+// Helper function that gets the data type and issues error if not supported
+// from pytorch source code
+ncclDataType_t getNcclDataType(at::ScalarType type) {
+  auto it = ncclDataType.find(type);
+  TORCH_CHECK(
+      it != ncclDataType.end(),
+      "Input tensor data type is not supported for NCCL process group: ",
+      type);
+  return it->second;
+}
+
+void check_tensors(std::vector<at::Tensor>& output_tensors,
+                    std::vector<at::Tensor>& input_tensors,
                     int world_size) {
-  if (inputTensors.size() == 0 || outputTensors.size() == 0) {
+  if (input_tensors.size() == 0 || output_tensors.size() == 0) {
     TORCH_CHECK(false, "output/input tensor list must be nonempty");
   }
-  if (outputTensors.size() != inputTensors.size()) {
+  if (output_tensors.size() != input_tensors.size()) {
     TORCH_CHECK(false, "output and input tensors must have same size");
   }
 
-  for (size_t i = 0; i < inputTensors.size(); ++i) {
-    auto out = outputTensors[i];
-    auto in = inputTensors[i];
+  for (size_t i = 0; i < input_tensors.size(); ++i) {
+    auto out = output_tensors[i];
+    auto in = input_tensors[i];
     if (out.numel() != in.numel() * world_size) {
       std::stringstream ss;
       ss << "output tensor numel != input tensor numel * world_size at" << i ;
@@ -42,13 +73,15 @@ void check_tensors(std::vector<at::Tensor>& outputTensors,
 // 
 // Note: reason for creating new ncclComm_t, ::c10d::ProcessGroupNCCL didn't expose
 // APIs for getting communicator
-ncclComm_t create_communicator(std::vector<at::Tensor>& inputTensors,
+ncclComm_t create_communicator(std::vector<at::Tensor>& input_tensors,
                                 std::string& pg_name, 
                                 ::c10d::ProcessGroupNCCL& pg) {
   int rank = pg.getRank();
   int world_size = pg.getSize();
-  at::Tensor& first_tensor = inputTensors[0];
+  at::Tensor& first_tensor = input_tensors[0];
   auto device_idx = first_tensor.get_device();
+  if (debug_flag)
+    printf("creating new communicator at device %ld\n", device_idx);
 
   // 
   ncclUniqueId nccl_id;
@@ -58,7 +91,6 @@ ncclComm_t create_communicator(std::vector<at::Tensor>& inputTensors,
     torch::TensorOptions()
       .dtype(torch::kUInt8)
       .layout(torch::kStrided) // dense tensor
-      .device(torch::kCUDA, device_idx)
       .requires_grad(false);
 
   std::vector<at::Tensor> bcast_tensor;
@@ -68,49 +100,112 @@ ncclComm_t create_communicator(std::vector<at::Tensor>& inputTensors,
       TORCH_CHECK(false, "Getting nccl unique id failed");
       // it suppose to exit
     } 
+    id_tensor_option.device(torch::kCPU);
+    at::Tensor cpu_tensor = torch::empty(sizeof(ncclUniqueId), id_tensor_option).zero_();
+    memcpy(cpu_tensor.data_ptr(), &nccl_id, sizeof(ncclUniqueId));
 
-    at::Tensor id_tensor = torch::from_blob(&nccl_id, {sizeof(ncclUniqueId)}, id_tensor_option);
+    at::Tensor id_tensor = cpu_tensor.to(first_tensor.device());
     bcast_tensor.push_back(std::move(id_tensor));
   } else {
-    at::Tensor id_tensor = torch::empty(sizeof(ncclUniqueId), id_tensor_option).zero_();
-    bcast_tensor.push_back(std::move(id_tensor));
+      at::Tensor id_tensor =
+          torch::empty(sizeof(ncclUniqueId), id_tensor_option).zero_().to(first_tensor.device());
+      bcast_tensor.push_back(std::move(id_tensor));
   }
+  if (debug_flag)
+      printf("rank %d, created tensor holder, device %ld, is_cuda %d \n",
+             rank,
+             device_idx,
+             bcast_tensor[0].is_cuda());
 
-  // TODO: 
   // bcast
-  auto work = pg.broadcast(bcast_tensor);
-  work->wait();
+  {
+    at::cuda::CUDAGuard gpuGuard(device_idx);
+    // make sure the allocated tensors are ready
+    AT_CUDA_CHECK(cudaDeviceSynchronize());
+    auto work = pg.broadcast(bcast_tensor);
+    // make sure the broadcast finished
+    AT_CUDA_CHECK(cudaDeviceSynchronize());
+  }
 
   // if rank != 0 
   // then need to copy ncclUniqueId from bcast_tensor
-  // TODO: 
+  if (rank != 0) {
+    auto cpu_tensor = bcast_tensor[0].to(at::kCPU);
+    std::memcpy(&nccl_id, cpu_tensor.data_ptr(), cpu_tensor.nbytes());
+  }
 
+  {
+    at::cuda::CUDAGuard gpuGuard(device_idx);
+    // init communicator and save
+    ncclCommInitRank(&nccl_comm, world_size, nccl_id, rank);
+    group_communicators[pg_name] = nccl_comm;
+
+    if (debug_flag) printf("nccl_comm initialized at rank %d, device %ld\n", rank, device_idx);
+  }
+
+  return nccl_comm;
 }
 
 // get communicator from global map
 // if not found, create a new one
-ncclComm_t get_communicator(std::vector<at::Tensor>& inputTensors, 
+ncclComm_t get_communicator(std::vector<at::Tensor>& input_tensors, 
                             std::string& pg_name, ::c10d::ProcessGroupNCCL& pg) {
   auto found = group_communicators.find(pg_name);
   if (found == group_communicators.end()) {
-    return create_communicator(pg_name, pg);
+    return create_communicator(input_tensors, pg_name, pg);
   } else {
     return found->second;
   }
 }
 
-int inplaceAllgather(std::vector<at::Tensor>& outputTensors,
-                     std::vector<at::Tensor>& inputTensors,
+int launch_nccl_allgather(std::vector<at::Tensor>& output_tensors,
+                           std::vector<at::Tensor>& input_tensors,
+                           ncclComm_t comm) {
+  auto& first_input = input_tensors[0];
+  auto device_idx = first_input.get_device();
+  if (debug_flag)
+      printf("launching allgather op with number of tensors %lu, at device %ld \n",
+             input_tensors.size(),
+             device_idx);
+
+  // this suppose to get the cuda stream specified by `with torch.cuda.stream(comm_stream): ...`
+  at::cuda::CUDAStream stream = at::cuda::getCurrentCUDAStream(device_idx);
+
+  ncclGroupStart();
+  for (size_t i = 0; i < input_tensors.size(); ++i) {
+    at::Tensor& input = input_tensors[i];
+    at::Tensor& output = output_tensors[i];
+    ncclAllGather(input.data_ptr(),
+                  output.data_ptr(),
+                  input.numel(),
+                  getNcclDataType(input.scalar_type()),
+                  comm,
+                  stream.stream());
+  }
+  ncclGroupEnd();
+
+  return 0;
+}
+
+int inplaceAllgather(std::vector<at::Tensor>& output_tensors,
+                     std::vector<at::Tensor>& input_tensors,
                      ::c10d::ProcessGroupNCCL& pg,
                      std::string pg_name
                      ) {
   // ::c10d::ProcessGroup& p_pg = pg;
-  printf("inplaceAllgather:: process group rank %d, size %d, pg_name %s \n", 
-        pg.getRank(), pg.getSize(), pg_name.c_str());
+  if (debug_flag)
+      printf("inplaceAllgather:: process group rank %d, size %d, pg_name %s \n",
+             pg.getRank(),
+             pg.getSize(),
+             pg_name.c_str());
 
-  check_tensors(outputTensors, inputTensors, pg.getSize());
+  check_tensors(output_tensors, input_tensors, pg.getSize());
 
-  return -1;
+  auto nccl_comm = get_communicator(input_tensors, pg_name, pg);
+
+  int res = launch_nccl_allgather(output_tensors, input_tensors, nccl_comm);
+
+  return res;
 }
 
 

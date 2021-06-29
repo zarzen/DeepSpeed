@@ -53,6 +53,7 @@ def _torch_allgather_once(output_tensors,
                           rank,
                           world_size):
     """"""
+    s = torch.cuda.Stream()
     handles = []
     for part_idx, part_size in enumerate(partition_sizes):
         output_t = output_tensors[part_idx]
@@ -103,6 +104,18 @@ def bench_torch_allgather(output_tensors,
 
     print_bw_rank0(partition_sizes, ts, input_tensors[0].dtype)
 
+def _custom_allgather_once(output_tensors, input_tensors, comm_stream):
+    default_pg = _get_default_group()
+    pg_name = _pg_names[default_pg]
+
+    with torch.cuda.stream(comm_stream):
+        res = ds_coll_comm.inplace_allgather(output_tensors,
+                                             input_tensors,
+                                             default_pg,
+                                             pg_name)
+    comm_stream.synchronize()
+    return res
+
 
 def bench_custom_allgather(output_tensors,
                            input_tensors,
@@ -112,18 +125,22 @@ def bench_custom_allgather(output_tensors,
                            warm_up=5,
                            repeat=10):
     """"""
-    default_pg = _get_default_group()
     comm_stream = torch.cuda.Stream(rank % torch.cuda.device_count())
-    pg_name = _pg_names[default_pg]
 
-    # ds_coll_comm.inplace_allgather(output_tensors,
-    #                                input_tensors,
-    #                                default_pg)
+    ts = []
+    for i in range(warm_up+repeat):
+        s = time.time()
+        _custom_allgather_once(output_tensors, input_tensors, comm_stream)
+        e = time.time()
 
-    ds_coll_comm.inplace_allgather([torch.ones(1*world_size)],
-                                   [torch.zeros(1)],
-                                   default_pg, 
-                                   pg_name)
+        if i >= warm_up:
+            ts.append(e - s)
+    
+    print_bw_rank0(partition_sizes, ts, input_tensors[0].dtype)
+
+def print_rank0(msg):
+    if (dist.get_rank() == 0):
+        print(msg)
 
 def main():
     """"""
@@ -152,12 +169,14 @@ def main():
     output_tensors, input_tensors = prepare_tensor(partition_sizes,
                          dist.get_world_size(), f'cuda:{device_id}',
                             torch.half)
-    # bench_torch_allgather(output_tensors,
-    #                       input_tensors,
-    #                       partition_sizes,
-    #                       rank,
-    #                       world_size)
+    print_rank0('Using torch.distributed.allgather')
+    bench_torch_allgather(output_tensors,
+                          input_tensors,
+                          partition_sizes,
+                          rank,
+                          world_size)
 
+    print_rank0('Using customized allgather')
     bench_custom_allgather(output_tensors,
                            input_tensors,
                            partition_sizes,
