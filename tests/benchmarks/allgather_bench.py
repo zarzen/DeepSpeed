@@ -1,0 +1,170 @@
+"""
+Test command: 
+python3 -m torch.distributed.launch --nnodes=1 --nproc_per_node=2 <this-file>
+"""
+
+import argparse
+
+import torch
+import math
+from torch._C import device
+import torch.distributed as dist
+from torch.distributed.distributed_c10d import _get_default_group, _pg_names
+from deepspeed.ops.op_builder import CommunicationBuilder
+import time
+import numpy as np
+
+ds_coll_comm = CommunicationBuilder().load()
+
+
+def sizeof_dtype(dtype):
+    if dtype == torch.half:
+        return 2
+    elif dtype == torch.float:
+        return 4
+    else:
+        return None
+
+
+def prepare_tensor(partition_sizes, world_size, device, dtype=torch.half):
+    # transformer layer structure with partitioned onto 8 GPUs
+
+    output_tensors = []
+    input_tensors = []
+
+    for _size in partition_sizes:
+        std = 1 / math.sqrt(_size)
+        input_t = torch.empty(_size,
+                              dtype=dtype,
+                              device=device).view(-1).uniform_(-std,
+                                                               std)
+        output_t = torch.empty(_size * world_size,
+                               dtype=dtype,
+                               device=device).view(-1).uniform_(-std,
+                                                                std)
+        input_tensors.append(input_t)
+        output_tensors.append(output_t)
+    return output_tensors, input_tensors
+
+
+def _torch_allgather_once(output_tensors,
+                          input_tensors,
+                          partition_sizes,
+                          rank,
+                          world_size):
+    """"""
+    handles = []
+    for part_idx, part_size in enumerate(partition_sizes):
+        output_t = output_tensors[part_idx]
+        input_t = input_tensors[part_idx]
+
+        output_list = []
+        for i in range(world_size):
+            out_tensor = output_t.narrow(0, i * part_size, part_size)
+            output_list.append(out_tensor)
+
+        h = dist.all_gather(output_list, input_t, async_op=True)
+        handles.append(h)
+
+    torch.cuda.synchronize()
+
+
+def print_bw_rank0(partition_sizes, time_costs, dtype):
+    if dist.get_rank() == 0:
+        elem_size = sizeof_dtype(dtype)  # in bytes
+        assert elem_size != None
+
+        numel = sum(partition_sizes)
+
+        avg_t = np.mean(time_costs)
+        bw = numel * elem_size * (dist.get_world_size() - 1) / 1e9 / avg_t
+        print(f'avg time {avg_t * 1e3} ms, bw {bw} GB/s')
+
+
+def bench_torch_allgather(output_tensors,
+                          input_tensors,
+                          partition_sizes,
+                          rank,
+                          world_size,
+                          warm_up=5,
+                          repeat=10):
+    ts = []
+    for i in range(warm_up + repeat):
+        s = time.time()
+        _torch_allgather_once(output_tensors,
+                              input_tensors,
+                              partition_sizes,
+                              rank,
+                              world_size)
+        e = time.time()
+
+        if i >= warm_up:
+            ts.append(e - s)
+
+    print_bw_rank0(partition_sizes, ts, input_tensors[0].dtype)
+
+
+def bench_custom_allgather(output_tensors,
+                           input_tensors,
+                           partition_sizes,
+                           rank,
+                           world_size,
+                           warm_up=5,
+                           repeat=10):
+    """"""
+    default_pg = _get_default_group()
+    comm_stream = torch.cuda.Stream(rank % torch.cuda.device_count())
+    pg_name = _pg_names[default_pg]
+
+    # ds_coll_comm.inplace_allgather(output_tensors,
+    #                                input_tensors,
+    #                                default_pg)
+
+    ds_coll_comm.inplace_allgather([torch.ones(1*world_size)],
+                                   [torch.zeros(1)],
+                                   default_pg, 
+                                   pg_name)
+
+def main():
+    """"""
+    dist.init_process_group(backend='nccl')
+
+    rank = dist.get_rank()
+    local_size = torch.cuda.device_count()
+    device_id = rank % local_size
+    world_size = dist.get_world_size()
+    torch.cuda.set_device(device_id)
+
+    partition_sizes = [
+        2457600,
+        960,
+        819200,
+        320,
+        320,
+        320,
+        3276800,
+        1280,
+        3276800,
+        320,
+        320,
+        320
+    ]
+    output_tensors, input_tensors = prepare_tensor(partition_sizes,
+                         dist.get_world_size(), f'cuda:{device_id}',
+                            torch.half)
+    # bench_torch_allgather(output_tensors,
+    #                       input_tensors,
+    #                       partition_sizes,
+    #                       rank,
+    #                       world_size)
+
+    bench_custom_allgather(output_tensors,
+                           input_tensors,
+                           partition_sizes,
+                           rank,
+                           world_size)
+
+
+
+if __name__ == '__main__':
+    main()

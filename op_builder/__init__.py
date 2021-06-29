@@ -10,6 +10,7 @@ from .stochastic_transformer import StochasticTransformerBuilder
 from .utils import UtilsBuilder
 from .async_io import AsyncIOBuilder
 from .builder import get_default_compute_capatabilities
+from .communication import CommunicationBuilder
 
 # TODO: infer this list instead of hard coded
 # List of all available ops
@@ -21,6 +22,7 @@ __op_builders__ = [
     TransformerBuilder(),
     StochasticTransformerBuilder(),
     UtilsBuilder(),
-    AsyncIOBuilder()
+    AsyncIOBuilder(),
+    CommunicationBuilder()
 ]
 ALL_OPS = {op.name: op for op in __op_builders__}
