@@ -21,7 +21,7 @@ from torch.distributed.distributed_c10d import _get_global_rank
 from .linear import LinearModuleForZeroStage3, LinearFunctionForZeroStage3
 from .offload_constants import *
 
-from ..utils import see_memory_usage
+from ..utils import info_rank_0, see_memory_usage
 from deepspeed.utils import log_dist, init_distributed, instrument_w_nvtx
 from deepspeed.utils.debug import debug_param2name_id_shape, debug_module2name, debug_param2name, debug_param2name_id_shape_status, printflock, log_rank_file
 
@@ -346,8 +346,12 @@ class AllGatherCoalescedHandle:
             param_offset = 0
             for param in self.__param_list:
                 partitions = []
+                if param.ds_status != ZeroParamStatus.INFLIGHT:
+                    continue
+                # info_rank_0(f'param status {param.ds_status}')
                 for rank in range(self.__world_size):
                     param_start = rank * param.ds_tensor.ds_numel
+                    # info_rank_0(f'allgather_handle wait, rank {rank}, param_offset {param_offset}, param_start {param_start}, world_size {self.__world_size}, chunk numel {self.__partitions[rank].numel()}')
                     if param_start < param.ds_numel:
                         part_to_copy = self.__partitions[rank].narrow(
                             0,

@@ -327,7 +327,8 @@ class PartitionedParameterCoordinator:
 
         for param in filter(lambda p: p.ds_id in params_to_release,
                             iter_params(submodule)):
-            param.ds_active_sub_modules.remove(submodule.id)
+            # param.ds_active_sub_modules.remove(submodule.id)
+            param.ds_active_sub_modules.discard(submodule.id)
             self.__release_param(param)
 
     @instrument_w_nvtx
