@@ -654,27 +654,34 @@ class Init(InsertPostInitMethodToModuleSubClasses):
 
     def _all_gather(self, param_list, async_op=False, hierarchy=None):
 
-        #fetches from nvme if the partition is not available and in nvme
-        self._ensure_availability_of_partitioned_params(param_list)
+        with torch.cuda.nvtx.range("allgather-ensure-availability"):
+            #fetches from nvme if the partition is not available and in nvme
+            self._ensure_availability_of_partitioned_params(param_list)
 
         handles = []
         all_gather_list = []
         for param in param_list:
             if param.ds_status == ZeroParamStatus.NOT_AVAILABLE:
+                # if async_op:
+                #     handle = self._allgather_param(param,
+                #                                    async_op=async_op,
+                #                                    hierarchy=hierarchy)
+                #     param.update_status(ZeroParamStatus.INFLIGHT
+                #                         if async_op else ZeroParamStatus.AVAILABLE)
+                #     handles.append(handle)
+                # else:
+                #     all_gather_list.append(param)
                 if async_op:
-                    handle = self._allgather_param(param,
-                                                   async_op=async_op,
-                                                   hierarchy=hierarchy)
-                    param.update_status(ZeroParamStatus.INFLIGHT
-                                        if async_op else ZeroParamStatus.AVAILABLE)
-                    handles.append(handle)
-                else:
-                    all_gather_list.append(param)
+                    param.update_status(ZeroParamStatus.INFLIGHT)
+                all_gather_list.append(param)
+        if async_op:
+            handles = self._allgather_params_with_custom_op(all_gather_list, hierarchy=hierarchy, async_op=True)
 
         if not async_op:
             # ret_value = self._allgather_params(all_gather_list, hierarchy=hierarchy)
             ret_value = self._allgather_params_with_custom_op(all_gather_list,
-                                                              hierarchy=hierarchy)
+                                                                hierarchy=hierarchy, 
+                                                                async_op=False)
             avail_params = []
             status_params = []
             for param in all_gather_list:
@@ -894,7 +901,7 @@ class Init(InsertPostInitMethodToModuleSubClasses):
         param.data = replicated_tensor.data
         return handle
 
-    def _allgather_params_with_custom_op(self, param_list, hierarchy=0):
+    def _allgather_params_with_custom_op(self, param_list, hierarchy=0, async_op=False):
         """ using customized allgather op to avoid redundant cudaMemcpy
         Note: the torch.distributed.allgather has extra copy:
         https://github.com/pytorch/pytorch/blob/v1.9.0/torch/lib/c10d/ProcessGroupNCCL.cpp#L1469
@@ -907,37 +914,41 @@ class Init(InsertPostInitMethodToModuleSubClasses):
         for param in param_list:
             partition_sizes.append(param.ds_tensor.ds_numel)
             local_tensors.append(param.ds_tensor)
-
-        # allocate memory for allgather params
-        allgather_output_params = []
-        for psize in partition_sizes:
-            tensor_size = psize * self.world_size
-            flat_tensor = torch.empty(tensor_size,
-                                      dtype=param_list[0].dtype,
-                                      device=self.local_device).view(-1)
-            flat_tensor.requres_grad = False
-            allgather_output_params.append(flat_tensor)
+        
+        with torch.cuda.nvtx.range("allgather-alloc-tensor"):
+            # allocate memory for allgather params
+            allgather_output_params = []
+            for psize in partition_sizes:
+                tensor_size = psize * self.world_size
+                flat_tensor = torch.empty(tensor_size,
+                                        dtype=param_list[0].dtype,
+                                        device=self.local_device).view(-1)
+                flat_tensor.requres_grad = False
+                allgather_output_params.append(flat_tensor)
 
         # suppose to set the communication stream outside of this function
         comm_stream = torch.cuda.current_stream()
 
-        # the handle is a wrapper of the start and the end events
-        comm_handle = ds_comm.inplace_allgather(allgather_output_params,
-                                                local_tensors,
-                                                self.ds_process_group,
-                                                comm_stream)
+        with torch.cuda.nvtx.range('allgather-launch'):
+            # the handle is a wrapper of the start and the end events
+            comm_handle = ds_comm.inplace_allgather(allgather_output_params,
+                                                    local_tensors,
+                                                    self.ds_process_group,
+                                                    comm_stream)
+        with torch.cuda.nvtx.range("allgather-assign-data"):
+            # assign to param.data (not copy)
+            for i, param in enumerate(param_list):
+                gathered_tensor = allgather_output_params[i]
+                param.data = gathered_tensor.narrow(0,
+                                                    0,
+                                                    param.ds_numel).view(param.ds_shape).data
+        if not async_op:
+            # this synchronize on cuda.Event
+            comm_handle.synchronize()
 
-        # assign to param.data (not copy)
-        for i, param in enumerate(param_list):
-            gathered_tensor = allgather_output_params[i]
-            param.data = gathered_tensor.narrow(0,
-                                                0,
-                                                param.ds_numel).view(param.ds_shape).data
-
-        # this synchronize on cuda.Event
-        comm_handle.synchronize()
-
-        return None
+            return None
+        else:
+            return [comm_handle] * len(param_list)
 
     def _allgather_params(self, param_list, hierarchy=0):
         if len(param_list) == 0:

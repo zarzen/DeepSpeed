@@ -361,22 +361,24 @@ class PartitionedParameterCoordinator(object):
             params_to_prefetch = self.prefetch_coordinator.get_params_to_prefetch(
                 sub_module,
                 numel=prefetch_numel)
+            with torch.cuda.nvtx.range("prefetch-launch-async-True"):
+                self._all_gather(params_to_prefetch, async_op=True)
+            
+            with torch.cuda.nvtx.range("prefetch-after-launch"):
+                for param in params_to_prefetch:
+                    assert param.ds_status == ZeroParamStatus.INFLIGHT, f'param {param.ds_id} is {param.ds_status} instead of {ZeroParamStatus.INFLIGHT}'
 
-            self._all_gather(params_to_prefetch, async_op=True)
-            for param in params_to_prefetch:
-                assert param.ds_status == ZeroParamStatus.INFLIGHT, f'param {param.ds_id} is {param.ds_status} instead of {ZeroParamStatus.INFLIGHT}'
+                    print_rank_0(
+                        f"{'--' * self.hierarchy}--PreFetching parameter {param.ds_id} numel {param.ds_numel} available {total_available_parameter_numel}, max limit {self.max_available_parameters_in_numel}",
+                        force=False)
 
+                if nvme:
+                    self._prefetch_nvme_param_partitions(sub_module, params_to_prefetch)
+
+                self._print_prefetch_elements_info(sub_module, params_to_prefetch)
                 print_rank_0(
-                    f"{'--' * self.hierarchy}--PreFetching parameter {param.ds_id} numel {param.ds_numel} available {total_available_parameter_numel}, max limit {self.max_available_parameters_in_numel}",
+                    f"{'--' * self.hierarchy}--PreFetching parameters {[param.ds_id for param in params_to_prefetch]} and available {total_available_parameter_numel}, max limit {self.max_available_parameters_in_numel}",
                     force=False)
-
-            if nvme:
-                self._prefetch_nvme_param_partitions(sub_module, params_to_prefetch)
-
-            self._print_prefetch_elements_info(sub_module, params_to_prefetch)
-            print_rank_0(
-                f"{'--' * self.hierarchy}--PreFetching parameters {[param.ds_id for param in params_to_prefetch]} and available {total_available_parameter_numel}, max limit {self.max_available_parameters_in_numel}",
-                force=False)
 
     def _print_prefetch_elements_info(self, sub_module, params_to_prefetch):
         sub_module_numel = 0.0
@@ -1561,29 +1563,30 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
 
         global FWD_MODULE_STACK
         FWD_MODULE_STACK.append(sub_module)
-        FORWARD_FETCH = 'forward_fetch'
-        FORWARD_PREFETCH = 'forward_prefetch'
+        # FORWARD_FETCH = 'forward_fetch'
+        # FORWARD_PREFETCH = 'forward_prefetch'
 
         self.param_coordinator.record_trace(sub_module)
 
-        self.timer_names.add(FORWARD_FETCH)
-        self.start_timers([FORWARD_FETCH])
+        # self.timer_names.add(FORWARD_FETCH)
+        # self.start_timers([FORWARD_FETCH])
         self.param_coordinator.fetch_sub_module(sub_module)
-        self.stop_timers([FORWARD_FETCH])
+        # self.stop_timers([FORWARD_FETCH])
 
         see_memory_usage(
             f"Before sub module function {sub_module.__class__.__name__} after fetch",
             force=False)
 
-        self.timer_names.add(FORWARD_PREFETCH)
-        self.start_timers([FORWARD_PREFETCH])
-        self.param_coordinator.prefetch_next_sub_modules(
-            sub_module,
-            available_parameter_numel=self.fp16_groups[0]
-            [0].get_available_parameter_numel(),
-            prefetch_numel=self.prefetch_elements,
-            nvme=self.params_in_nvme_and_cpu)
-        self.stop_timers([FORWARD_PREFETCH])
+        # self.timer_names.add(FORWARD_PREFETCH)
+        # self.start_timers([FORWARD_PREFETCH])
+        with torch.cuda.nvtx.range("forward-prefetch"):
+            self.param_coordinator.prefetch_next_sub_modules(
+                sub_module,
+                available_parameter_numel=self.fp16_groups[0]
+                [0].get_available_parameter_numel(),
+                prefetch_numel=self.prefetch_elements,
+                nvme=self.params_in_nvme_and_cpu)
+        # self.stop_timers([FORWARD_PREFETCH])
 
         see_memory_usage(
             f"Before sub module function {sub_module.__class__.__name__} after prefetch",
@@ -1604,22 +1607,23 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
 
     def pre_sub_module_backward_function(self, sub_module):
         self.param_coordinator.record_trace(sub_module)
-        BACKWARD_FETCH = 'backward_fetch'
-        BACKWARD_PREFETCH = 'backward_prefetch'
+        # BACKWARD_FETCH = 'backward_fetch'
+        # BACKWARD_PREFETCH = 'backward_prefetch'
 
-        self.timer_names.add(BACKWARD_FETCH)
-        self.start_timers([BACKWARD_FETCH])
+        # self.timer_names.add(BACKWARD_FETCH)
+        # self.start_timers([BACKWARD_FETCH])
         self.param_coordinator.fetch_sub_module(sub_module)
-        self.stop_timers([BACKWARD_FETCH])
+        # self.stop_timers([BACKWARD_FETCH])
 
-        self.timer_names.add(BACKWARD_PREFETCH)
-        self.start_timers([BACKWARD_PREFETCH])
-        self.param_coordinator.prefetch_next_sub_modules(
-            sub_module,
-            available_parameter_numel=self.fp16_groups[0]
-            [0].get_available_parameter_numel(),
-            prefetch_numel=self.prefetch_elements)
-        self.stop_timers([BACKWARD_PREFETCH])
+        # self.timer_names.add(BACKWARD_PREFETCH)
+        # self.start_timers([BACKWARD_PREFETCH])
+        with torch.cuda.nvtx.range("backward-prefetch"):
+            self.param_coordinator.prefetch_next_sub_modules(
+                sub_module,
+                available_parameter_numel=self.fp16_groups[0]
+                [0].get_available_parameter_numel(),
+                prefetch_numel=self.prefetch_elements)
+        # self.stop_timers([BACKWARD_PREFETCH])
 
         self.param_coordinator.increment_step(sub_module)
 
