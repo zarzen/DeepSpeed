@@ -12,16 +12,20 @@ class CommunicationHandle:
     def __init__(self,
                  start_event: torch.cuda.Event,
                  end_event: torch.cuda.Event,
+                 comm_stream: torch.cuda.Stream,
                  timing: bool) -> None:
 
         self.start = start_event
         self.end = end_event
         self.timing = timing
+        self.stream = comm_stream
 
     def is_completed(self, ):
         return self.end.query()
 
-    def wait(self, stream):
+    def wait(self, stream=None):
+        if stream is None:
+            stream = self.stream
         self.end.wait(stream)
 
     def synchronize(self):
@@ -57,4 +61,4 @@ def inplace_allgather(output_tensors, input_tensors, group, comm_stream, timing=
 
         end_event.record(comm_stream)
 
-    return CommunicationHandle(start_event, end_event, timing)
+    return CommunicationHandle(start_event, end_event, comm_stream, timing)

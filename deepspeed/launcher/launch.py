@@ -111,6 +111,14 @@ def main():
     current_env["WORLD_SIZE"] = str(dist_world_size)
 
     processes = []
+    nsys_output_file = "/tmp/deepspeed-pid-%p"
+    enable_nsys_profile = False
+    if os.getenv('NSYS_PROFILE') == '1':
+        if os.getenv('NSYS_OUTPUT'):
+            nsys_output_file = os.getenv('NSYS_OUTPUT')
+        print("enabling nsys profile for rank0")
+        enable_nsys_profile = True
+
     for local_rank in range(0, num_local_procs):
         # each process's rank
         dist_rank = global_rank_mapping[local_node][local_rank]
@@ -124,6 +132,9 @@ def main():
             args.training_script,
             "--local_rank={}".format(local_rank)
         ] + args.training_script_args
+
+        if enable_nsys_profile and int(dist_rank) == 0:
+            cmd = ['nsys', 'profile', '-o', nsys_output_file] + cmd
 
         sig_names = {2: "SIGINT", 15: "SIGTERM"}
         last_return_code = None

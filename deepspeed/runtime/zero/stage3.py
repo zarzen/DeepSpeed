@@ -306,6 +306,8 @@ class PartitionedParameterCoordinator(object):
         # max distance between two use of the module beyond which module is released
         self.max_reuse_distance_in_numel = max_reuse_distance_in_numel
 
+        self._comm_stream = torch.cuda.Stream(-1)
+
     '''-----------------------Tracing and Prefetching ---------------'''
 
     def record_trace(self, sub_module):
@@ -535,10 +537,11 @@ class PartitionedParameterCoordinator(object):
         return reuse_distance_in_numel < self.max_reuse_distance_in_numel
 
     def _all_gather(self, partitioned_params, async_op=False):
-        handles = partitioned_params[0].all_gather(
-            param_list=partitioned_params,
-            async_op=async_op,
-            hierarchy=self.hierarchy) if partitioned_params else None
+        with torch.cuda.stream(self._comm_stream):
+            handles = partitioned_params[0].all_gather(
+                param_list=partitioned_params,
+                async_op=async_op,
+                hierarchy=self.hierarchy) if partitioned_params else None
 
         if handles is not None:
             self.in_flight_handles.extend(handles)

@@ -852,15 +852,15 @@ class Init(InsertPostInitMethodToModuleSubClasses):
         see_memory_usage(
             f'Before allocate allgather param {debug_param2name_id_shape_status(param)} partition_size={partition_size} ',
             force=False)
-        flat_tensor = torch.zeros(aligned_param_size,
+        flat_tensor = torch.empty(aligned_param_size,
                                   dtype=param.dtype,
                                   device=param.device).view(-1)
         see_memory_usage(
             f'After allocate allgather param {debug_param2name_id_shape_status(param)} {aligned_param_size} {partition_size} ',
             force=False)
 
-        if not async_op:
-            torch.cuda.synchronize()
+        # if not async_op:
+        #     torch.cuda.synchronize()
 
         print_rank_0(
             f"{'--'* hierarchy}----allgather param with {debug_param2name_id_shape_status(param)} partition size={partition_size}"
@@ -878,10 +878,17 @@ class Init(InsertPostInitMethodToModuleSubClasses):
             if i == torch.distributed.get_rank(group=self.ds_process_group):
                 partitions[i].data.copy_(param.ds_tensor.data, non_blocking=True)
 
-        handle = torch.distributed.all_gather(partitions,
-                                              partitions[self.rank],
-                                              group=self.ds_process_group,
-                                              async_op=async_op)
+        # handle = torch.distributed.all_gather(partitions,
+        #                                       partitions[self.rank],
+        #                                       group=self.ds_process_group,
+        #                                       async_op=async_op)
+
+        # get the stream from outside
+        comm_stream = torch.cuda.current_stream()
+        handle = ds_comm.inplace_allgather([flat_tensor],
+                                           [param.ds_tensor],
+                                           self.ds_process_group,
+                                           comm_stream)
 
         replicated_tensor = flat_tensor.narrow(0, 0, param.ds_numel).view(param.ds_shape)
         param.data = replicated_tensor.data
