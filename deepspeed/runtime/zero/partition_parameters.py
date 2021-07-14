@@ -24,6 +24,7 @@ from deepspeed.utils.debug import debug_param2name_id_shape, debug_module2name, 
 
 from ..swap_tensor.partitioned_param_swapper import AsyncPartitionedParameterSwapper, PartitionedParamStatus
 from ..config import DeepSpeedConfig
+from .utils import w_nvtx
 
 param_count = 0
 partitioned_param_data_shape = [1]
@@ -599,6 +600,7 @@ class Init(InsertPostInitMethodToModuleSubClasses):
                 param_list = [cls]
             self._update_status(param_list, new_status)
 
+        @w_nvtx
         def get_available_parameter_numel():
             return self._get_available_parameter_numel()
 
@@ -729,84 +731,88 @@ class Init(InsertPostInitMethodToModuleSubClasses):
 
             #if torch.distributed.get_rank():
             #    print(f"Releasing {param.data.numel()}")
-            if param.ds_tensor is not None and not has_been_updated:
+            with torch.cuda.nvtx.range("if-1"):
+                if param.ds_tensor is not None and not has_been_updated:
 
-                #param.data = param.ds_tensor.data
+                    #param.data = param.ds_tensor.data
 
-                see_memory_usage(
-                    f'Before partitioning param {param.ds_id} {param.shape}',
-                    force=False)
-                #param.data does not store anything meaningful in partitioned state
-                param.data = torch.ones(1, dtype=self.dtype).to(param.device)
-                see_memory_usage(f'After partitioning param {param.ds_id} {param.shape}',
-                                 force=False)
-
-                if param.ds_tensor.final_location == OFFLOAD_NVME_DEVICE:
-                    print_rank_0(
-                        f"Param {param.ds_id} partition released since it exists in nvme",
+                    see_memory_usage(
+                        f'Before partitioning param {param.ds_id} {param.shape}',
                         force=False)
-                    param.nvme_swapper.remove_partition_and_release_buffers([param])
+                    #param.data does not store anything meaningful in partitioned state
+                    # param.data = torch.ones(1, dtype=self.dtype).to(param.device)
+                    param.data = torch.empty(1, dtype=self.dtype, device=param.device)
+                    see_memory_usage(f'After partitioning param {param.ds_id} {param.shape}',
+                                    force=False)
 
-                return
+                    if param.ds_tensor.final_location == OFFLOAD_NVME_DEVICE:
+                        print_rank_0(
+                            f"Param {param.ds_id} partition released since it exists in nvme",
+                            force=False)
+                        param.nvme_swapper.remove_partition_and_release_buffers([param])
 
-            tensor_size = self._aligned_size(param)
-            partition_size = tensor_size // self.world_size
+                    return
 
-            if param.ds_tensor is None:
-                final_location = None
-                if self.remote_device == OFFLOAD_NVME_DEVICE and self.param_swapper.swappable_tensor(
-                        numel=partition_size):
-                    final_location = OFFLOAD_NVME_DEVICE
-                    buffer = self.param_swapper.get_buffer(param, partition_size)
-                    partitioned_tensor = torch.zeros(1,
-                                                     dtype=param.dtype,
-                                                     device=buffer.device)
-                    partitioned_tensor.data = buffer.data
-                    print_rank_0(
-                        f"ID {param.ds_id} Initializing partition for the first time for nvme offload."
-                    )
+            with torch.cuda.nvtx.range("if-2"):
+                tensor_size = self._aligned_size(param)
+                partition_size = tensor_size // self.world_size
+
+                if param.ds_tensor is None:
+                    final_location = None
+                    if self.remote_device == OFFLOAD_NVME_DEVICE and self.param_swapper.swappable_tensor(
+                            numel=partition_size):
+                        final_location = OFFLOAD_NVME_DEVICE
+                        buffer = self.param_swapper.get_buffer(param, partition_size)
+                        partitioned_tensor = torch.zeros(1,
+                                                        dtype=param.dtype,
+                                                        device=buffer.device)
+                        partitioned_tensor.data = buffer.data
+                        print_rank_0(
+                            f"ID {param.ds_id} Initializing partition for the first time for nvme offload."
+                        )
+
+                    else:
+                        partitioned_tensor = torch.zeros(
+                            partition_size,
+                            dtype=param.dtype,
+                            device=OFFLOAD_CPU_DEVICE
+                            if self.remote_device == OFFLOAD_NVME_DEVICE else
+                            self.remote_device)
+                        if self.pin_memory:
+                            partitioned_tensor = partitioned_tensor.pin_memory()
+
+                    partitioned_tensor.requires_grad = False
+                    param.ds_tensor = partitioned_tensor
+                    param.ds_tensor.ds_numel = partition_size
+                    param.ds_tensor.status = PartitionedParamStatus.AVAILABLE
+                    param.ds_tensor.final_location = final_location
+
+            with torch.cuda.nvtx.range("if-3"):
+                start = partition_size * self.rank
+                end = start + partition_size
+
+                one_dim_param = param.contiguous().view(-1)
+
+                if start < param.ds_numel and end <= param.ds_numel:
+                    src_tensor = one_dim_param.narrow(0, start, partition_size)
+
+                    param.ds_tensor.copy_(src_tensor)
+                    #partitioned_tensor = src_tensor.clone().detach().to(self.remote_device)
 
                 else:
-                    partitioned_tensor = torch.zeros(
-                        partition_size,
-                        dtype=param.dtype,
-                        device=OFFLOAD_CPU_DEVICE
-                        if self.remote_device == OFFLOAD_NVME_DEVICE else
-                        self.remote_device)
-                    if self.pin_memory:
-                        partitioned_tensor = partitioned_tensor.pin_memory()
+                    # partitioned_tensor = torch.zeros(partition_size,
+                    #                                  dtype=param.dtype,
+                    #                                  device=self.remote_device )
 
-                partitioned_tensor.requires_grad = False
-                param.ds_tensor = partitioned_tensor
-                param.ds_tensor.ds_numel = partition_size
-                param.ds_tensor.status = PartitionedParamStatus.AVAILABLE
-                param.ds_tensor.final_location = final_location
-
-            start = partition_size * self.rank
-            end = start + partition_size
-
-            one_dim_param = param.contiguous().view(-1)
-
-            if start < param.ds_numel and end <= param.ds_numel:
-                src_tensor = one_dim_param.narrow(0, start, partition_size)
-
-                param.ds_tensor.copy_(src_tensor)
-                #partitioned_tensor = src_tensor.clone().detach().to(self.remote_device)
-
-            else:
-                # partitioned_tensor = torch.zeros(partition_size,
-                #                                  dtype=param.dtype,
-                #                                  device=self.remote_device )
-
-                if start < param.ds_numel:
-                    elements_to_copy = param.ds_numel - start
-                    param.ds_tensor.narrow(0,
-                                           0,
-                                           elements_to_copy).copy_(
-                                               one_dim_param.narrow(
-                                                   0,
-                                                   start,
-                                                   elements_to_copy))
+                    if start < param.ds_numel:
+                        elements_to_copy = param.ds_numel - start
+                        param.ds_tensor.narrow(0,
+                                            0,
+                                            elements_to_copy).copy_(
+                                                one_dim_param.narrow(
+                                                    0,
+                                                    start,
+                                                    elements_to_copy))
 
             #print(f"Remote device {self.remote_device}")
 
@@ -816,23 +822,25 @@ class Init(InsertPostInitMethodToModuleSubClasses):
 
             #param.data does not store anything meaningful in partitioned state
 
-            see_memory_usage(f'Before partitioning param {param.ds_id} {param.shape}',
-                             force=False)
-            param.data = torch.ones(1, dtype=self.dtype).to(param.device)
-            see_memory_usage(f'After partitioning param {param.ds_id} {param.shape}',
-                             force=False)
+            with torch.cuda.nvtx.range("partition_param-last-part"):
+                see_memory_usage(f'Before partitioning param {param.ds_id} {param.shape}',
+                                force=False)
+                # param.data = torch.ones(1, dtype=self.dtype).to(param.device)
+                param.data = torch.ones(1, dtype=self.dtype, device=param.device)
+                see_memory_usage(f'After partitioning param {param.ds_id} {param.shape}',
+                                force=False)
 
-            if param.ds_tensor.final_location == OFFLOAD_NVME_DEVICE:
-                self.param_swapper.swap_out_and_release([param])
+                if param.ds_tensor.final_location == OFFLOAD_NVME_DEVICE:
+                    self.param_swapper.swap_out_and_release([param])
+                    print_rank_0(
+                        f"ID {param.ds_id} Offloaded to nvme offload and buffers released.")
+                    see_memory_usage(
+                        f"ID {param.ds_id} Offloaded to nvme offload and buffers released.",
+                        force=False)
+
                 print_rank_0(
-                    f"ID {param.ds_id} Offloaded to nvme offload and buffers released.")
-                see_memory_usage(
-                    f"ID {param.ds_id} Offloaded to nvme offload and buffers released.",
-                    force=False)
-
-            print_rank_0(
-                f"ID {param.ds_id} partitioned type {param.dtype} dev {param.device} shape {param.shape}"
-            )
+                    f"ID {param.ds_id} partitioned type {param.dtype} dev {param.device} shape {param.shape}"
+                )
 
     def _param_status(self, param):
         if param.ds_tensor is not None:

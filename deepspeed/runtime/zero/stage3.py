@@ -26,6 +26,8 @@ from deepspeed.runtime.zero.offload_constants import *
 from deepspeed.runtime.swap_tensor.partitioned_param_swapper import PartitionedParamStatus
 from deepspeed.runtime.swap_tensor.partitioned_optimizer_swapper import PartitionedOptimizerSwapper
 from deepspeed.runtime.swap_tensor.pipelined_optimizer_swapper import PipelinedOptimizerSwapper
+from deepspeed.runtime.zero.utils import w_nvtx
+
 
 # Toggle this to true to enable correctness test
 # with gradient partitioning and without
@@ -207,6 +209,7 @@ class PrefetchCoordinator(object):
         self.step_id = 0
 
     # returns the next numel parameters that will be used next but are not available or inflight
+    @w_nvtx
     def get_params_to_prefetch(self, sub_module, numel=2000000):
 
         # numel_in_sub_module = 0
@@ -309,7 +312,7 @@ class PartitionedParameterCoordinator(object):
         self._comm_stream = torch.cuda.Stream(-1)
 
     '''-----------------------Tracing and Prefetching ---------------'''
-
+    @w_nvtx
     def record_trace(self, sub_module):
         self.prefetch_coordinator.record_trace(sub_module)
 
@@ -401,6 +404,7 @@ class PartitionedParameterCoordinator(object):
 
     # Fetches the parameters in the sub_module
     # This call is blocking
+    @w_nvtx
     def fetch_sub_module(self, sub_module):
         partitioned_params = []
         params_in_flight = False
@@ -489,30 +493,32 @@ class PartitionedParameterCoordinator(object):
             param.ds_active_sub_modules -= 1
             if not param.ds_active_sub_modules and not self._keep_for_later(
                     sub_module) and not param.ds_persist:
-                print_rank_0(
-                    f"{'--' * self.hierarchy}--Releasing parameter {debug_param2name_id_numel(param)} active sub modules {param.ds_active_sub_modules} and keep for later {self._keep_for_later(sub_module)}",
-                    force=False)
+                with torch.cuda.nvtx.range("release_sub_module_if_then"):
+                    print_rank_0(
+                        f"{'--' * self.hierarchy}--Releasing parameter {debug_param2name_id_numel(param)} active sub modules {param.ds_active_sub_modules} and keep for later {self._keep_for_later(sub_module)}",
+                        force=False)
 
-                total_available_parameter_numel = param.get_available_parameter_numel()
+                    total_available_parameter_numel = param.get_available_parameter_numel()
 
-                print_rank_0(
-                    f"{'--' * self.hierarchy}--Releasing parameter {param.ds_id} numel {param.ds_numel} available {total_available_parameter_numel}, max limit {self.max_available_parameters_in_numel}",
-                    force=False)
+                    print_rank_0(
+                        f"{'--' * self.hierarchy}--Releasing parameter {param.ds_id} numel {param.ds_numel} available {total_available_parameter_numel}, max limit {self.max_available_parameters_in_numel}",
+                        force=False)
 
-                see_memory_usage(
-                    f"Before releasing param {debug_param2name_id_numel(param)}",
-                    force=False)
-                param.partition(hierarchy=self.hierarchy)
-                see_memory_usage(
-                    f"After releasing param {debug_param2name_id_numel(param)}",
-                    force=False)
+                    see_memory_usage(
+                        f"Before releasing param {debug_param2name_id_numel(param)}",
+                        force=False)
+                    with torch.cuda.nvtx.range("param.partition"):
+                        param.partition(hierarchy=self.hierarchy)
+                    see_memory_usage(
+                        f"After releasing param {debug_param2name_id_numel(param)}",
+                        force=False)
 
-                assert param.ds_status == ZeroParamStatus.NOT_AVAILABLE, f'param {param.ds_id} is {param.ds_status} instead of {ZeroParamStatus.NOT_AVAILABLE}'
+                    assert param.ds_status == ZeroParamStatus.NOT_AVAILABLE, f'param {param.ds_id} is {param.ds_status} instead of {ZeroParamStatus.NOT_AVAILABLE}'
             else:
-
-                print_rank_0(
-                    f"{'--' * self.hierarchy}--Did not release param {debug_param2name_id_numel(param)} with active sub modules {param.ds_active_sub_modules}, keep for later={self._keep_for_later(sub_module)} and persistence={param.ds_persist}",
-                    force=False)
+                with torch.cuda.nvtx.range("release_sub_module_else"):
+                    print_rank_0(
+                        f"{'--' * self.hierarchy}--Did not release param {debug_param2name_id_numel(param)} with active sub modules {param.ds_active_sub_modules}, keep for later={self._keep_for_later(sub_module)} and persistence={param.ds_persist}",
+                        force=False)
 
     def release_and_reset_parameter(self, param):
         param.ds_active_sub_modules = 0
@@ -528,6 +534,7 @@ class PartitionedParameterCoordinator(object):
 
             param.partition()
 
+    @w_nvtx
     def _keep_for_later(self, sub_module):
         if not self.prefetch_coordinator.trace_completed:
             return False
@@ -1417,6 +1424,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
         self.hierarchy = 0
 
         #reset step at the beginning of forward
+        @w_nvtx
         def _pre_forward_hook(module, *args):
             self.param_coordinator.reset_step()
 
@@ -1458,45 +1466,48 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
             count[0] = count[0] + 1
             self._register_hooks_recursively(child, count=count)
 
+        @w_nvtx
         def _pre_forward_module_hook(module, *args):
             self.pre_sub_module_forward_function(module)
 
+        @w_nvtx
         def _post_forward_module_hook(module, input, output):
             global FWD_MODULE_STACK
             FWD_MODULE_STACK.pop()
-            if output is None:
-                output = []
-            elif not isinstance(output, (list, tuple)):
-                if torch.is_tensor(output):
-                    output = [output]
-                else:
-                    #print(f'got UNKNOWN type {type(output)}')
-                    outputs = []
-                    output = output if isinstance(output, dict) else vars(output)
-                    for name, val in output.items():
-                        if not name.startswith('__') and torch.is_tensor(val):
-                            outputs.append(val)
-                    output = outputs
-                    #print(f'convert output to {output}')
-
-            for item in filter(lambda item: is_zero_param(item), output):
-                if not any(id(item) in m._external_params for m in FWD_MODULE_STACK):
-                    item.ds_active_sub_modules += 1
-                    module_to_register = FWD_MODULE_STACK[-1]
-                    print_rank_0(
-                        f'Registering dangling parameter for module {module_to_register.__class__.__name__}.',
-                        force=False)
-                    register_external_parameter(module_to_register, item)
-
-                    # It's possible that the parameter was already external to the completed module. If so, remove it the
-                    # registration as it will be covered by the outer module instead.
-                    if id(item) in module._external_params:
+            with torch.cuda.nvtx.range("_post_forward_module_hook_1"):
+                if output is None:
+                    output = []
+                elif not isinstance(output, (list, tuple)):
+                    if torch.is_tensor(output):
+                        output = [output]
+                    else:
+                        #print(f'got UNKNOWN type {type(output)}')
+                        outputs = []
+                        output = output if isinstance(output, dict) else vars(output)
+                        for name, val in output.items():
+                            if not name.startswith('__') and torch.is_tensor(val):
+                                outputs.append(val)
+                        output = outputs
+                        #print(f'convert output to {output}')
+            with torch.cuda.nvtx.range("_post_forward_module_hook_2"):
+                for item in filter(lambda item: is_zero_param(item), output):
+                    if not any(id(item) in m._external_params for m in FWD_MODULE_STACK):
+                        item.ds_active_sub_modules += 1
+                        module_to_register = FWD_MODULE_STACK[-1]
                         print_rank_0(
-                            f'  Unregistering nested dangling parameter from module {module.__class__.__name__}',
+                            f'Registering dangling parameter for module {module_to_register.__class__.__name__}.',
                             force=False)
-                        unregister_external_parameter(module, item)
+                        register_external_parameter(module_to_register, item)
 
-                    item.all_gather()
+                        # It's possible that the parameter was already external to the completed module. If so, remove it the
+                        # registration as it will be covered by the outer module instead.
+                        if id(item) in module._external_params:
+                            print_rank_0(
+                                f'  Unregistering nested dangling parameter from module {module.__class__.__name__}',
+                                force=False)
+                            unregister_external_parameter(module, item)
+
+                        item.all_gather()
 
             self.post_sub_module_forward_function(module)
 
@@ -1579,7 +1590,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
 
         # self.timer_names.add(FORWARD_PREFETCH)
         # self.start_timers([FORWARD_PREFETCH])
-        with torch.cuda.nvtx.range("forward-prefetch"):
+        with torch.cuda.nvtx.range("prefetch_next_sub_modules"):
             self.param_coordinator.prefetch_next_sub_modules(
                 sub_module,
                 available_parameter_numel=self.fp16_groups[0]
@@ -1594,6 +1605,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
 
         self.param_coordinator.increment_step(sub_module)
 
+    @w_nvtx
     def post_sub_module_forward_function(self, sub_module):
         see_memory_usage(
             f"After sub module function {sub_module.__class__.__name__} {sub_module.id} before release",
