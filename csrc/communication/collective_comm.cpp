@@ -5,6 +5,7 @@
 #include <c10d/ProcessGroupNCCL.hpp>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <iostream>
 #include <sstream>
 #include <string>
@@ -12,6 +13,28 @@
 #include <vector>
 
 int debug_flag = std::getenv("DS_DEBUG") ? std::stoi(std::getenv("DS_DEBUG")) : 0;
+
+class LogObj {
+    std::ofstream log_stream;
+
+public:
+    LogObj(){};
+
+    void init(std::string& filepath) { log_stream.open(filepath.c_str()); };
+
+    void log(std::string msg, std::string log_file = "")
+    {
+        if (!log_stream.is_open()) log_stream.open(log_file.c_str());
+        log_stream << msg;
+    };
+
+    ~LogObj()
+    {
+        if (log_stream.is_open()) log_stream.close();
+    };
+};
+
+LogObj debug_logger;
 
 // recording created ncclComm_t
 // using processGroup Name as key
@@ -166,13 +189,24 @@ int launch_nccl_allgather(std::vector<at::Tensor>& output_tensors,
 {
     auto& first_input = input_tensors[0];
     auto device_idx = first_input.get_device();
-    if (debug_flag)
-        printf("launching allgather op with number of tensors %lu, at device %ld \n",
-               input_tensors.size(),
-               device_idx);
+    // if (debug_flag)
+    //     printf("launching allgather op with number of tensors %lu, at device %ld \n",
+    //            input_tensors.size(),
+    //            device_idx);
 
     // this suppose to get the cuda stream specified by `with torch.cuda.stream(comm_stream): ...`
     at::cuda::CUDAStream stream = at::cuda::getCurrentCUDAStream(device_idx);
+
+    // sync
+    AT_CUDA_CHECK(cudaStreamSynchronize(stream.stream()));
+    at::cuda::OptionalCUDAGuard gpuGuard;
+    for (size_t i = 0; i < input_tensors.size(); ++i) {
+        gpuGuard.set_index(device_idx);
+        c10::cuda::CUDACachingAllocator::recordStream(input_tensors[i].storage().data_ptr(),
+                                                      stream);
+        c10::cuda::CUDACachingAllocator::recordStream(output_tensors[i].storage().data_ptr(),
+                                                      stream);
+    }
 
     ncclGroupStart();
     for (size_t i = 0; i < input_tensors.size(); ++i) {
@@ -184,14 +218,15 @@ int launch_nccl_allgather(std::vector<at::Tensor>& output_tensors,
                       getNcclDataType(input.scalar_type()),
                       comm,
                       stream.stream());
+
         if (debug_flag) {
-            printf("rank %d/%d, allgather tensor %lu/%lu, numel %ld, stream_id %d \n",
-                   pg.getRank(),
-                   pg.getSize(),
-                   i,
-                   input_tensors.size(),
-                   input.numel(),
-                   stream.id());
+            std::stringstream ss;
+            ss << "rank " << pg.getRank() << "/" << pg.getSize() << ", allgather tensor " << i
+               << "/" << input_tensors.size() << ", numel " << input.numel() << ", stream_id "
+               << stream.id() << "\n";
+
+            debug_logger.log(ss.str(),
+                             "/tmp/ds_coll_log_rank_" + std::to_string(pg.getRank()) + ".log");
         }
     }
     ncclGroupEnd();
@@ -205,11 +240,11 @@ int inplaceAllgather(std::vector<at::Tensor>& output_tensors,
                      std::string pg_name)
 {
     // ::c10d::ProcessGroup& p_pg = pg;
-    if (debug_flag)
-        printf("inplaceAllgather:: process group rank %d, size %d, pg_name %s \n",
-               pg.getRank(),
-               pg.getSize(),
-               pg_name.c_str());
+    // if (debug_flag)
+    //     printf("inplaceAllgather:: process group rank %d, size %d, pg_name %s \n",
+    //            pg.getRank(),
+    //            pg.getSize(),
+    //            pg_name.c_str());
 
     check_tensors(output_tensors, input_tensors, pg.getSize());
 
