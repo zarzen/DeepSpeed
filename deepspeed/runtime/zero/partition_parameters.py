@@ -1192,10 +1192,10 @@ class Init(InsertPostInitMethodToModuleSubClasses):
 
     def _synchronize_communication(self, param_list, handle_list):
         for param, handle in zip(param_list, handle_list):
-            print_rank_0(f'synchronizing param id {param.ds_id}', force=True)
+            # print_rank_0(f'synchronizing param id {param.ds_id}', force=True)
             if handle is not None:
                 handle.wait()
-            print_rank_0(f'synced, param id {param.ds_id}', force=True)
+            # print_rank_0(f'synced, param id {param.ds_id}', force=True)
 
         self._update_status(param_list=param_list, new_status=ZeroParamStatus.AVAILABLE)
 

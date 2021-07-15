@@ -3,6 +3,7 @@
 Licensed under the MIT license.
 """
 
+from logging import debug
 import sys
 import os
 from collections import defaultdict, OrderedDict
@@ -315,18 +316,22 @@ class PartitionedParameterCoordinator(object):
         self.prefetch_launching_lock = threading.Lock()
         self.prefetch_launching = set()
         self.prefetching_queue = Queue()
+        self.prefetching_thd = None
+
+    def start_prefetching_thread(self):
         self.prefetching_thd = threading.Thread(target=self.prefetch_thd_func,
                                                 args=(self.prefetching_queue,
                                                       ))
         self.prefetching_thd.start()
+        print_rank_0('started prefetching thread', debug=False)
 
-    def finalize(self):
-        # def __del__(self):
-        print('destructor partitionedparameterCoordinator')
+    def close_prefetching_thread(self):
+        print_rank_0('closing prefetching thread', force=False)
+        # if self.prefetching_thd is not None:
         self.prefetching_queue.put([None, None, None, None])
-        print_rank_0('closing prefetching thread', force=True)
         self.prefetching_thd.join()
-        print_rank_0('closed prefetching thread', force=True)
+        self.prefetching_thd = None
+        print_rank_0('closed prefetching thread', force=False)
 
     '''-----------------------Tracing and Prefetching ---------------'''
 
@@ -371,9 +376,9 @@ class PartitionedParameterCoordinator(object):
             self.increment_step(sub_module)
             with self.prefetch_launching_lock:
                 self.prefetch_launching.discard(sub_module)
-            print_rank_0(f'launched prefetch next params of module id {sub_module.id}',
-                         force=True)
-            print_rank_0(f'prefetch_queue empty {prefetch_queue.empty()}', force=True)
+            # print_rank_0(f'launched prefetch next params of module id {sub_module.id}',
+            #              force=True)
+            # print_rank_0(f'prefetch_queue empty {prefetch_queue.empty()}', force=True)
 
     def async_prefetch_next_sub_modules(self,
                                         sub_module,
@@ -382,6 +387,9 @@ class PartitionedParameterCoordinator(object):
                                         nvme=False):
         """
         """
+        if self.prefetching_thd is None:
+            self.start_prefetching_thread()
+
         with self.prefetch_launching_lock:
             self.prefetch_launching.add(sub_module)
         self.prefetching_queue.put(
@@ -462,11 +470,11 @@ class PartitionedParameterCoordinator(object):
                     for m in self.prefetch_launching:
                         print_rank_0(
                             f'has unlaunched prefetch tasks for next params of module id {m.id}',
-                            force=True)
+                            force=False)
                 time.sleep(0.001)
                 with self.prefetch_launching_lock:
                     un_launched = len(self.prefetch_launching)
-        print_rank_0(f'all pretech task launched', force=True)
+            print_rank_0(f'all pretech task launched', force=False)
 
     # Fetches the parameters in the sub_module
     # This call is blocking
@@ -697,10 +705,6 @@ INITIAL_MICRO_STEP_ID = -1
 
 
 class FP16_DeepSpeedZeroOptimizer_Stage3(object):
-    def finalize(self):
-        print('destructor FP16_DeepSpeedZeroOptimizer_Stage3')
-        self.param_coordinator.finalize()
-
     """
     DeepSpeedZeroOptimizer designed to reduce the memory footprint
     required for training large deep learning models.
@@ -711,7 +715,6 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
     For usage examples, refer to TODO: DeepSpeed Tutorial
 
     """
-
     def __init__(self,
                  module,
                  init_optimizer,
@@ -2902,6 +2905,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
         """
             Not supporting closure.
             """
+        self.param_coordinator.close_prefetching_thread()
         self._pre_step()
 
         #checks for overflow, adjust the loss scale accordingly
