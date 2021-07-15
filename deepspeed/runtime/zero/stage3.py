@@ -391,6 +391,8 @@ class PartitionedParameterCoordinator(object):
             self.start_prefetching_thread()
 
         with self.prefetch_launching_lock:
+            if sub_module in self.prefetch_launching:
+                return
             self.prefetch_launching.add(sub_module)
         self.prefetching_queue.put(
             [sub_module,

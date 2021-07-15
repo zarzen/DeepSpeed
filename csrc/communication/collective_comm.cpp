@@ -161,7 +161,8 @@ ncclComm_t get_communicator(std::vector<at::Tensor>& input_tensors,
 
 int launch_nccl_allgather(std::vector<at::Tensor>& output_tensors,
                           std::vector<at::Tensor>& input_tensors,
-                          ncclComm_t comm)
+                          ncclComm_t comm,
+                          ::c10d::ProcessGroupNCCL& pg)
 {
     auto& first_input = input_tensors[0];
     auto device_idx = first_input.get_device();
@@ -183,6 +184,15 @@ int launch_nccl_allgather(std::vector<at::Tensor>& output_tensors,
                       getNcclDataType(input.scalar_type()),
                       comm,
                       stream.stream());
+        if (debug_flag) {
+            printf("rank %d/%d, allgather tensor %lu/%lu, numel %ld, stream_id %d \n",
+                   pg.getRank(),
+                   pg.getSize(),
+                   i,
+                   input_tensors.size(),
+                   input.numel(),
+                   stream.id());
+        }
     }
     ncclGroupEnd();
 
@@ -205,7 +215,7 @@ int inplaceAllgather(std::vector<at::Tensor>& output_tensors,
 
     auto nccl_comm = get_communicator(input_tensors, pg_name, pg);
 
-    int res = launch_nccl_allgather(output_tensors, input_tensors, nccl_comm);
+    int res = launch_nccl_allgather(output_tensors, input_tensors, nccl_comm, pg);
 
     return res;
 }
