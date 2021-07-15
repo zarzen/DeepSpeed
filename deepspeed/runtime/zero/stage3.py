@@ -13,6 +13,8 @@ import torch.distributed as dist
 import math
 from torch._six import inf
 from torch.autograd import Variable
+from queue import Queue
+import threading
 
 from deepspeed.utils.logging import logger
 from deepspeed.runtime.fp16.loss_scaler import LossScaler, DynamicLossScaler
@@ -27,7 +29,6 @@ from deepspeed.runtime.swap_tensor.partitioned_param_swapper import PartitionedP
 from deepspeed.runtime.swap_tensor.partitioned_optimizer_swapper import PartitionedOptimizerSwapper
 from deepspeed.runtime.swap_tensor.pipelined_optimizer_swapper import PipelinedOptimizerSwapper
 from deepspeed.runtime.zero.utils import w_nvtx
-
 
 # Toggle this to true to enable correctness test
 # with gradient partitioning and without
@@ -222,7 +223,7 @@ class PrefetchCoordinator(object):
         # tracing failed. The sub_module passed at the step_id must match with the sub_module during tracing
         if sub_module.id != self.sub_module_trace[self.step_id]:
             print_rank_0(
-                f"Tracing failed. Prefetching is disabled at sub-module: {sub_module.id}",
+                f"Tracing failed. Prefetching is disabled at sub-module: {sub_module.id} != step_id {self.step_id}",
                 force=True)
             return []
 
@@ -311,7 +312,24 @@ class PartitionedParameterCoordinator(object):
 
         self._comm_stream = torch.cuda.Stream(-1)
 
+        self.prefetch_launching_lock = threading.Lock()
+        self.prefetch_launching = set()
+        self.prefetching_queue = Queue()
+        self.prefetching_thd = threading.Thread(target=self.prefetch_thd_func,
+                                                args=(self.prefetching_queue,
+                                                      ))
+        self.prefetching_thd.start()
+
+    def finalize(self):
+        # def __del__(self):
+        print('destructor partitionedparameterCoordinator')
+        self.prefetching_queue.put([None, None, None, None])
+        print_rank_0('closing prefetching thread', force=True)
+        self.prefetching_thd.join()
+        print_rank_0('closed prefetching thread', force=True)
+
     '''-----------------------Tracing and Prefetching ---------------'''
+
     @w_nvtx
     def record_trace(self, sub_module):
         self.prefetch_coordinator.record_trace(sub_module)
@@ -339,13 +357,46 @@ class PartitionedParameterCoordinator(object):
         if len(swap_in_params) > 0:
             swap_in_params[0].nvme_swapper.swap_in(swap_in_params, async_op=True)
 
+    def prefetch_thd_func(self, prefetch_queue):
+        """"""
+        while True:
+            sub_module, availabel_param_numel, prefetch_numel, nvme = prefetch_queue.get()
+            if sub_module is None:
+                return
+
+            self._prefetch_next_sub_modules(sub_module,
+                                            availabel_param_numel,
+                                            prefetch_numel=prefetch_numel,
+                                            nvme=nvme)
+            self.increment_step(sub_module)
+            with self.prefetch_launching_lock:
+                self.prefetch_launching.discard(sub_module)
+            print_rank_0(f'launched prefetch next params of module id {sub_module.id}',
+                         force=True)
+            print_rank_0(f'prefetch_queue empty {prefetch_queue.empty()}', force=True)
+
+    def async_prefetch_next_sub_modules(self,
+                                        sub_module,
+                                        available_parameter_numel,
+                                        prefetch_numel=5000000,
+                                        nvme=False):
+        """
+        """
+        with self.prefetch_launching_lock:
+            self.prefetch_launching.add(sub_module)
+        self.prefetching_queue.put(
+            [sub_module,
+             available_parameter_numel,
+             prefetch_numel,
+             nvme])
+
     # Pre fetches the parameters for sub_modules that comes after
     #  the current sub_module. This call is asynchronous
-    def prefetch_next_sub_modules(self,
-                                  sub_module,
-                                  available_parameter_numel,
-                                  prefetch_numel=5000000,
-                                  nvme=False):
+    def _prefetch_next_sub_modules(self,
+                                   sub_module,
+                                   available_parameter_numel,
+                                   prefetch_numel=5000000,
+                                   nvme=False):
         if not self.prefetch_coordinator.trace_completed:
             return
 
@@ -366,7 +417,7 @@ class PartitionedParameterCoordinator(object):
                 numel=prefetch_numel)
             with torch.cuda.nvtx.range("prefetch-launch-async-True"):
                 self._all_gather(params_to_prefetch, async_op=True)
-            
+
             with torch.cuda.nvtx.range("prefetch-after-launch"):
                 for param in params_to_prefetch:
                     assert param.ds_status == ZeroParamStatus.INFLIGHT, f'param {param.ds_id} is {param.ds_status} instead of {ZeroParamStatus.INFLIGHT}'
@@ -402,10 +453,27 @@ class PartitionedParameterCoordinator(object):
 
     '''----------------------------------------------------------------------'''
 
+    def _wait_for_ongoing_prefetch_launch(self, ):
+        with self.prefetch_launching_lock:
+            un_launched = len(self.prefetch_launching)
+        if un_launched:
+            while un_launched:
+                with self.prefetch_launching_lock:
+                    for m in self.prefetch_launching:
+                        print_rank_0(
+                            f'has unlaunched prefetch tasks for next params of module id {m.id}',
+                            force=True)
+                time.sleep(0.001)
+                with self.prefetch_launching_lock:
+                    un_launched = len(self.prefetch_launching)
+        print_rank_0(f'all pretech task launched', force=True)
+
     # Fetches the parameters in the sub_module
     # This call is blocking
     @w_nvtx
     def fetch_sub_module(self, sub_module):
+        self._wait_for_ongoing_prefetch_launch()
+
         partitioned_params = []
         params_in_flight = False
         # print_rank_0(f"{'--' * self.hierarchy}Fetching params in module {sub_module.__class__.__name__}")
@@ -498,7 +566,8 @@ class PartitionedParameterCoordinator(object):
                         f"{'--' * self.hierarchy}--Releasing parameter {debug_param2name_id_numel(param)} active sub modules {param.ds_active_sub_modules} and keep for later {self._keep_for_later(sub_module)}",
                         force=False)
 
-                    total_available_parameter_numel = param.get_available_parameter_numel()
+                    total_available_parameter_numel = param.get_available_parameter_numel(
+                    )
 
                     print_rank_0(
                         f"{'--' * self.hierarchy}--Releasing parameter {param.ds_id} numel {param.ds_numel} available {total_available_parameter_numel}, max limit {self.max_available_parameters_in_numel}",
@@ -628,6 +697,10 @@ INITIAL_MICRO_STEP_ID = -1
 
 
 class FP16_DeepSpeedZeroOptimizer_Stage3(object):
+    def finalize(self):
+        print('destructor FP16_DeepSpeedZeroOptimizer_Stage3')
+        self.param_coordinator.finalize()
+
     """
     DeepSpeedZeroOptimizer designed to reduce the memory footprint
     required for training large deep learning models.
@@ -638,6 +711,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
     For usage examples, refer to TODO: DeepSpeed Tutorial
 
     """
+
     def __init__(self,
                  module,
                  init_optimizer,
@@ -1591,7 +1665,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
         # self.timer_names.add(FORWARD_PREFETCH)
         # self.start_timers([FORWARD_PREFETCH])
         with torch.cuda.nvtx.range("prefetch_next_sub_modules"):
-            self.param_coordinator.prefetch_next_sub_modules(
+            self.param_coordinator.async_prefetch_next_sub_modules(
                 sub_module,
                 available_parameter_numel=self.fp16_groups[0]
                 [0].get_available_parameter_numel(),
@@ -1603,7 +1677,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
             f"Before sub module function {sub_module.__class__.__name__} after prefetch",
             force=False)
 
-        self.param_coordinator.increment_step(sub_module)
+        # self.param_coordinator.increment_step(sub_module)
 
     @w_nvtx
     def post_sub_module_forward_function(self, sub_module):
@@ -1630,14 +1704,14 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
         # self.timer_names.add(BACKWARD_PREFETCH)
         # self.start_timers([BACKWARD_PREFETCH])
         with torch.cuda.nvtx.range("backward-prefetch"):
-            self.param_coordinator.prefetch_next_sub_modules(
+            self.param_coordinator.async_prefetch_next_sub_modules(
                 sub_module,
                 available_parameter_numel=self.fp16_groups[0]
                 [0].get_available_parameter_numel(),
                 prefetch_numel=self.prefetch_elements)
         # self.stop_timers([BACKWARD_PREFETCH])
 
-        self.param_coordinator.increment_step(sub_module)
+        # self.param_coordinator.increment_step(sub_module)
 
     def post_sub_module_backward_function(self, sub_module):
         see_memory_usage(

@@ -677,13 +677,15 @@ class Init(InsertPostInitMethodToModuleSubClasses):
                     param.update_status(ZeroParamStatus.INFLIGHT)
                 all_gather_list.append(param)
         if async_op:
-            handles = self._allgather_params_with_custom_op(all_gather_list, hierarchy=hierarchy, async_op=True)
+            handles = self._allgather_params_with_custom_op(all_gather_list,
+                                                            hierarchy=hierarchy,
+                                                            async_op=True)
 
         if not async_op:
             # ret_value = self._allgather_params(all_gather_list, hierarchy=hierarchy)
             ret_value = self._allgather_params_with_custom_op(all_gather_list,
-                                                                hierarchy=hierarchy, 
-                                                                async_op=False)
+                                                              hierarchy=hierarchy,
+                                                              async_op=False)
             avail_params = []
             status_params = []
             for param in all_gather_list:
@@ -742,8 +744,9 @@ class Init(InsertPostInitMethodToModuleSubClasses):
                     #param.data does not store anything meaningful in partitioned state
                     # param.data = torch.ones(1, dtype=self.dtype).to(param.device)
                     param.data = torch.empty(1, dtype=self.dtype, device=param.device)
-                    see_memory_usage(f'After partitioning param {param.ds_id} {param.shape}',
-                                    force=False)
+                    see_memory_usage(
+                        f'After partitioning param {param.ds_id} {param.shape}',
+                        force=False)
 
                     if param.ds_tensor.final_location == OFFLOAD_NVME_DEVICE:
                         print_rank_0(
@@ -764,8 +767,8 @@ class Init(InsertPostInitMethodToModuleSubClasses):
                         final_location = OFFLOAD_NVME_DEVICE
                         buffer = self.param_swapper.get_buffer(param, partition_size)
                         partitioned_tensor = torch.zeros(1,
-                                                        dtype=param.dtype,
-                                                        device=buffer.device)
+                                                         dtype=param.dtype,
+                                                         device=buffer.device)
                         partitioned_tensor.data = buffer.data
                         print_rank_0(
                             f"ID {param.ds_id} Initializing partition for the first time for nvme offload."
@@ -807,12 +810,12 @@ class Init(InsertPostInitMethodToModuleSubClasses):
                     if start < param.ds_numel:
                         elements_to_copy = param.ds_numel - start
                         param.ds_tensor.narrow(0,
-                                            0,
-                                            elements_to_copy).copy_(
-                                                one_dim_param.narrow(
-                                                    0,
-                                                    start,
-                                                    elements_to_copy))
+                                               0,
+                                               elements_to_copy).copy_(
+                                                   one_dim_param.narrow(
+                                                       0,
+                                                       start,
+                                                       elements_to_copy))
 
             #print(f"Remote device {self.remote_device}")
 
@@ -823,17 +826,19 @@ class Init(InsertPostInitMethodToModuleSubClasses):
             #param.data does not store anything meaningful in partitioned state
 
             with torch.cuda.nvtx.range("partition_param-last-part"):
-                see_memory_usage(f'Before partitioning param {param.ds_id} {param.shape}',
-                                force=False)
+                see_memory_usage(
+                    f'Before partitioning param {param.ds_id} {param.shape}',
+                    force=False)
                 # param.data = torch.ones(1, dtype=self.dtype).to(param.device)
                 param.data = torch.ones(1, dtype=self.dtype, device=param.device)
                 see_memory_usage(f'After partitioning param {param.ds_id} {param.shape}',
-                                force=False)
+                                 force=False)
 
                 if param.ds_tensor.final_location == OFFLOAD_NVME_DEVICE:
                     self.param_swapper.swap_out_and_release([param])
                     print_rank_0(
-                        f"ID {param.ds_id} Offloaded to nvme offload and buffers released.")
+                        f"ID {param.ds_id} Offloaded to nvme offload and buffers released."
+                    )
                     see_memory_usage(
                         f"ID {param.ds_id} Offloaded to nvme offload and buffers released.",
                         force=False)
@@ -922,15 +927,15 @@ class Init(InsertPostInitMethodToModuleSubClasses):
         for param in param_list:
             partition_sizes.append(param.ds_tensor.ds_numel)
             local_tensors.append(param.ds_tensor)
-        
+
         with torch.cuda.nvtx.range("allgather-alloc-tensor"):
             # allocate memory for allgather params
             allgather_output_params = []
             for psize in partition_sizes:
                 tensor_size = psize * self.world_size
                 flat_tensor = torch.empty(tensor_size,
-                                        dtype=param_list[0].dtype,
-                                        device=self.local_device).view(-1)
+                                          dtype=param_list[0].dtype,
+                                          device=self.local_device).view(-1)
                 flat_tensor.requres_grad = False
                 allgather_output_params.append(flat_tensor)
 
@@ -949,7 +954,8 @@ class Init(InsertPostInitMethodToModuleSubClasses):
                 gathered_tensor = allgather_output_params[i]
                 param.data = gathered_tensor.narrow(0,
                                                     0,
-                                                    param.ds_numel).view(param.ds_shape).data
+                                                    param.ds_numel).view(
+                                                        param.ds_shape).data
         if not async_op:
             # this synchronize on cuda.Event
             comm_handle.synchronize()
@@ -1186,8 +1192,10 @@ class Init(InsertPostInitMethodToModuleSubClasses):
 
     def _synchronize_communication(self, param_list, handle_list):
         for param, handle in zip(param_list, handle_list):
+            print_rank_0(f'synchronizing param id {param.ds_id}', force=True)
             if handle is not None:
                 handle.wait()
+            print_rank_0(f'synced, param id {param.ds_id}', force=True)
 
         self._update_status(param_list=param_list, new_status=ZeroParamStatus.AVAILABLE)
 
