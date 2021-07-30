@@ -2014,6 +2014,9 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
 
         with torch.cuda.stream(self.copy_grad_stream):
             self.reduction_stream.synchronize()
+            _params_list_for_partition = []
+            _buffer_for_partitions = []
+
             for param in self.previous_reduced_grads:
 
                 [i,
@@ -2065,8 +2068,19 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
                         0,
                         dest_offset,
                         num_elements)
-                    param.partition_gradients(
-                        partition_buffers=fp16_grad_tensor,
+
+                    _params_list_for_partition.append(param)
+                    _buffer_for_partitions.append(fp16_grad_tensor)
+
+                    # with torch.cuda.nvtx.range("partition_grads_acc_True"):
+                    #     param.partition_gradients(
+                    #         partition_buffers=fp16_grad_tensor,
+                    #         accumulate=True if self.micro_step_id > 0 else False)
+            if len(_params_list_for_partition) > 0:
+                with torch.cuda.nvtx.range("grouped_grads_partition"):
+                    self.previous_reduced_grads[0].partition_gradients(
+                        param_list=_params_list_for_partition,
+                        partition_buffers=_buffer_for_partitions,
                         accumulate=True if self.micro_step_id > 0 else False)
 
             if self.offload_optimizer and self.swap_optimizer:

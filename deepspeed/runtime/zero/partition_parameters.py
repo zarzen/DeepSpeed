@@ -1249,7 +1249,8 @@ class Init(InsertPostInitMethodToModuleSubClasses):
             # if source and destinatoin are on same device,
             # add to the provided buffer
             elif src_tensor.device == dest_tensor.device:
-                dest_tensor.add_(src_tensor)
+                with torch.cuda.nvtx.range('acc_add'):
+                    dest_tensor.add_(src_tensor)
 
             # if source and destination are on different device, copy first to src
             # then add and move back to the destination. This seems to run faster
