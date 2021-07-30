@@ -245,25 +245,19 @@ class PartitionedParameterCoordinator:
             for param in list(iter_params(sub_module)):
                 self.__param_order.append((self.__step_id, param))
 
-    def finish_tracing(self) -> None:
-        """express that we have completed tracing"""
-        info_rank_0(f"module trace: {[m.id for m in self.__submodule_order]}")
-        if not self.__trace_complete:
-            self.__submodule_order = tuple(self.__submodule_order)  # freeze
-            self.__param_order = tuple(self.__param_order)  # freeze
-            self.__param_queue = collections.deque(self.__param_order)
-            self.__trace_complete = True
-
     def increment_step(self) -> None:
         """indicate that we have taken a step forward in the model"""
         self.__step_id += 1
 
     def reset_step(self) -> None:
-        """indicate that we are about to start a new pass through the model"""
+        """indicate that we have completed one fwd+bwd for the model"""
+        info_rank_0(
+            f"completed fwd+bwd with trace: {[m.id for m in self.__submodule_order]}")
         if not self.__trace_complete:
-            raise RuntimeError(
-                f"trace needs to be completed before resetting step. current trace: {[m.id for m in self.__submodule_order]}"
-            )
+            self.__submodule_order = tuple(self.__submodule_order)  # freeze
+            self.__param_order = tuple(self.__param_order)  # freeze
+            self.__trace_complete = True
+
         self.__param_queue = collections.deque(self.__param_order)  # reset fetch queue
         self.__most_recent_step_id_param_fetched_for = collections.defaultdict(
             lambda: int(-1e10))
@@ -2869,7 +2863,6 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
 
         self.loss_scaler.backward(loss.float(), retain_graph=retain_graph)
 
-        self.param_coordinator.finish_tracing()
         self.param_coordinator.reset_step()
         '''Partitioning Parameters that were not partitioned
         Usually if parameters of modules whose input parameters do not require
