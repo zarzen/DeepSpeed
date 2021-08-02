@@ -16,6 +16,7 @@ import torch.distributed
 from torch.distributed.distributed_c10d import _get_global_rank
 from torch.nn import Parameter
 import torch.distributed.distributed_c10d as c10d
+import torch.distributed as dist
 
 from .linear import LinearModuleForZeroStage3, LinearFunctionForZeroStage3
 from .offload_constants import *
@@ -432,7 +433,8 @@ class Init(InsertPostInitMethodToModuleSubClasses):
                  pin_memory=False,
                  config=None,
                  enabled=True,
-                 dtype=None):
+                 dtype=None,
+                 local_shard=None):
         """A context to enable massive model construction for training with
         ZeRO-3. Models are automatically partitioned (or, sharded) across the
         system and converted to half precision.
@@ -548,6 +550,35 @@ class Init(InsertPostInitMethodToModuleSubClasses):
         #It is the device where parameters are fully instantiated using allgather
         self.local_device = torch.device('cuda:{}'.format(os.environ["LOCAL_RANK"]))
 
+        self.local_shard = local_shard if local_shard else os.environ.get(
+            'DS_LOCAL_SHARD')
+        self.ds_param_shard_group = self.ds_process_group  # default to all ranks
+        self.ds_param_shard_size = self.world_size  # default with world-size
+        self.ds_param_repli_group = None
+        self.ds_param_repli_size = None
+        if local_shard:
+            print(f'rank {self.rank} enable local shard')
+            assert data_parallel_group is None, "data_parallel_group should be None, when local_shard is set"
+            n_devices = torch.cuda.device_count()
+            local_group_id = self.rank // n_devices
+            local_group_ranks = [
+                local_group_id * n_devices + i for i in range(n_devices)
+            ]
+
+            # create param shard group
+            self.ds_param_shard_group = dist.new_group(local_group_ranks, backend='nccl')
+            self.ds_param_shard_size = n_devices
+
+            # create ds_param replicate group
+            # assume param and gradient sharded in same group
+            nnodes = dist.get_world_size() // n_devices
+            replicate_ranks = [self.rank + n_devices * i for i in range(nnodes)]
+            self.ds_param_repli_group = dist.new_group(replicate_ranks, backend='nccl')
+            self.ds_param_repli_size = len(replicate_ranks)
+
+            self.world_size = dist.get_world_size(group=self.ds_param_shard_group)
+            assert self.world_size == n_devices
+
         self._validate_remote_device(remote_device, config)
 
         #Remote device is the device where parameter partiitons are stored
@@ -639,6 +670,8 @@ class Init(InsertPostInitMethodToModuleSubClasses):
 
         # The group that the parameter is scattered across.
         param.ds_process_group = self.ds_process_group
+        param.ds_param_shard_group = self.ds_param_shard_group
+        param.ds_param_repli_group = self.ds_param_repli_group
 
         # This is set to the Async Param swapper if remote device is nvme
         # else this is set to None
@@ -680,7 +713,7 @@ class Init(InsertPostInitMethodToModuleSubClasses):
                     raise RuntimeError(
                         f"all tensors must have same dtype, got {data_types}")
                 dtype, = data_types
-                flat_tensor = torch.empty(partition_sz * self.world_size,
+                flat_tensor = torch.empty(partition_sz * self.ds_param_shard_size,
                                           dtype=dtype,
                                           device=self.local_device,
                                           requires_grad=False)
@@ -694,7 +727,7 @@ class Init(InsertPostInitMethodToModuleSubClasses):
                     input_tensors = []
                     offset = 0
                     for p in params_to_gather:
-                        _numel = p.ds_tensor.ds_numel * self.world_size
+                        _numel = p.ds_tensor.ds_numel * self.ds_param_shard_size
                         _output = flat_tensor.narrow(0, offset, _numel)
                         output_tensors.append(_output)
                         offset += _numel
@@ -704,39 +737,41 @@ class Init(InsertPostInitMethodToModuleSubClasses):
                     all_gather_handle = instrument_w_nvtx(
                         c10d._all_gather_base_coalesced)(output_tensors,
                                                          input_tensors,
-                                                         group=self.ds_process_group,
+                                                         group=self.ds_param_shard_group,
                                                          async_op=True)
 
                     return AllGatherCoalescedHandle(handle=all_gather_handle,
                                                     params=params_to_gather,
                                                     partitions=[],
-                                                    world_size=self.world_size,
+                                                    world_size=self.ds_param_shard_size,
                                                     comm_stream=self.comm_stream,
                                                     split_launch=True,
                                                     output_tensors=output_tensors)
 
                 # if _all_gather_base_coalesced not available
                 partitions = []
-                for i in range(self.world_size):
+                for i in range(self.ds_param_shard_size):
                     partitions.append(
                         flat_tensor.narrow(0,
                                            partition_sz * i,
                                            partition_sz))
 
                 offset = 0
+                shard_rank = dist.get_rank(group=self.ds_param_shard_group)
+
                 for p in params_to_gather:
                     param_numel = p.ds_tensor.ds_numel
-                    partitions[self.rank].narrow(0,
-                                                 offset,
-                                                 param_numel).copy_(p.ds_tensor.data,
-                                                                    non_blocking=True)
+                    partitions[shard_rank].narrow(0,
+                                                  offset,
+                                                  param_numel).copy_(p.ds_tensor.data,
+                                                                     non_blocking=True)
                     offset += param_numel
 
                 all_gather_handle = instrument_w_nvtx(
                     torch.distributed._all_gather_base)(
                         flat_tensor,
-                        partitions[self.rank],
-                        group=self.ds_process_group,
+                        partitions[shard_rank],
+                        group=self.ds_param_shard_group,
                         async_op=True,
                     )
 
@@ -744,7 +779,7 @@ class Init(InsertPostInitMethodToModuleSubClasses):
                     handle=all_gather_handle,
                     params=params_to_gather,
                     partitions=partitions,
-                    world_size=self.world_size,
+                    world_size=self.ds_param_shard_size,
                     comm_stream=self.comm_stream,
                 )
 
@@ -825,8 +860,8 @@ class Init(InsertPostInitMethodToModuleSubClasses):
         return param.ds_numel + self._padding_size(param)
 
     def _padding_size(self, param):
-        remainder = param.ds_numel % self.world_size
-        return (self.world_size - remainder) if remainder else 0
+        remainder = param.ds_numel % self.ds_param_shard_size
+        return (self.ds_param_shard_size - remainder) if remainder else 0
 
     def _partitioned_size(self, param):
         return param.ds_tensor.ds_numel
@@ -922,7 +957,7 @@ class Init(InsertPostInitMethodToModuleSubClasses):
                 return
 
             tensor_size = self._aligned_size(param)
-            partition_size = tensor_size // self.world_size
+            partition_size = tensor_size // self.ds_param_shard_size
 
             if param.ds_tensor is None:
                 final_location = None
@@ -954,7 +989,8 @@ class Init(InsertPostInitMethodToModuleSubClasses):
                 param.ds_tensor.status = PartitionedParamStatus.AVAILABLE
                 param.ds_tensor.final_location = final_location
 
-            start = partition_size * self.rank
+            shard_rank = dist.get_rank(group=self.ds_param_shard_group)
+            start = partition_size * shard_rank
             end = start + partition_size
 
             one_dim_param = param.contiguous().view(-1)
@@ -1021,7 +1057,7 @@ class Init(InsertPostInitMethodToModuleSubClasses):
 
         partition_size = param.ds_tensor.ds_numel
 
-        tensor_size = partition_size * self.world_size
+        tensor_size = partition_size * self.ds_param_shard_size
         aligned_param_size = self._aligned_size(param)
         assert tensor_size == aligned_param_size, f'param id {param.ds_id} aligned size {aligned_param_size} does not match tensor size {tensor_size}'
 
@@ -1051,15 +1087,16 @@ class Init(InsertPostInitMethodToModuleSubClasses):
         #            param.data = replicated_tensor.data
         #            return None
         partitions = []
-        for i in range(self.world_size):
+        shard_rank = dist.get_rank(group=self.ds_param_shard_group)
+        for i in range(self.ds_param_shard_size):
             partitions.append(flat_tensor.narrow(0, partition_size * i, partition_size))
 
-            if i == torch.distributed.get_rank(group=self.ds_process_group):
+            if i == shard_rank:
                 partitions[i].data.copy_(param.ds_tensor.data, non_blocking=True)
 
         handle = torch.distributed.all_gather(partitions,
-                                              partitions[self.rank],
-                                              group=self.ds_process_group,
+                                              partitions[shard_rank],
+                                              group=self.ds_param_shard_group,
                                               async_op=async_op)
 
         replicated_tensor = flat_tensor.narrow(0, 0, param.ds_numel).view(param.ds_shape)
@@ -1072,18 +1109,19 @@ class Init(InsertPostInitMethodToModuleSubClasses):
 
         partition_size = sum([param.ds_tensor.ds_numel for param in param_list])
 
-        tensor_size = partition_size * self.world_size
+        tensor_size = partition_size * self.ds_param_shard_size
         flat_tensor = torch.empty(tensor_size,
                                   dtype=param_list[0].dtype,
                                   device=self.local_device)
         flat_tensor.requres_grad = False
         partitions = []
-        for i in range(self.world_size):
+        shard_rank = dist.get_rank(group=self.ds_param_shard_group)
+        for i in range(self.ds_param_shard_size):
             start = partition_size * i
 
             partitions.append(flat_tensor.narrow(0, start, partition_size))
 
-            if i == self.rank:
+            if i == shard_rank:
                 offset = 0
                 for param in param_list:
                     param_numel = param.ds_tensor.ds_numel
@@ -1095,8 +1133,8 @@ class Init(InsertPostInitMethodToModuleSubClasses):
                     offset += param_numel
 
         torch.distributed.all_gather(partitions,
-                                     partitions[self.rank],
-                                     group=self.ds_process_group,
+                                     partitions[shard_rank],
+                                     group=self.ds_param_shard_group,
                                      async_op=False)
         param_offset = 0
 
@@ -1107,7 +1145,7 @@ class Init(InsertPostInitMethodToModuleSubClasses):
                                             dtype=param.dtype,
                                             device=self.local_device)
 
-            for i in range(self.world_size):
+            for i in range(self.ds_param_shard_size):
 
                 start = i * partition_size
 
@@ -1139,6 +1177,7 @@ class Init(InsertPostInitMethodToModuleSubClasses):
 
             handles_and_reduced_partitions.append(self._reduce_scatter_gradient(param))
 
+        shard_rank = dist.get_rank(group=self.ds_param_shard_group)
         for param, (handle, reduced_partition) in zip(param_list, handles_and_reduced_partitions):
             if handle is not None:
                 handle.wait()
@@ -1147,7 +1186,7 @@ class Init(InsertPostInitMethodToModuleSubClasses):
             # For these ranks the output of reduce scatter is a separate buffer and needs
             # to be copied in
             partition_size = param.ds_tensor.ds_numel
-            start = self.rank * partition_size
+            start = shard_rank * partition_size
             end = start + partition_size
             #print_rank_0("REduce scatter was executed for praam {param.ds_id}")
             if start < param.ds_numel and end > param.ds_numel:
@@ -1165,10 +1204,10 @@ class Init(InsertPostInitMethodToModuleSubClasses):
         partition_size = param.ds_tensor.ds_numel
         #output = torch.empty(partition_size, dtype=param.dtype, device=param.device)
 
-        total_size = partition_size * self.world_size
+        total_size = partition_size * self.ds_param_shard_size
         input_list = []
 
-        for i in range(self.world_size):
+        for i in range(self.ds_param_shard_size):
 
             start = i * partition_size
             end = start + partition_size
@@ -1192,11 +1231,17 @@ class Init(InsertPostInitMethodToModuleSubClasses):
             #print("after reduce scatter gradients")
             input_list.append(input)
 
-        rank = torch.distributed.get_rank(group=self.ds_process_group)
-        handle = torch.distributed.reduce_scatter(input_list[rank],
-                                                  input_list,
-                                                  group=self.ds_process_group,
-                                                  async_op=True)
+        rank = dist.get_rank(group=self.ds_param_shard_group)
+        handle = dist.reduce_scatter(input_list[rank],
+                                     input_list,
+                                     group=self.ds_param_shard_group,
+                                     async_op=True)
+        if self.local_shard:
+            # do the all_reduce with sharded part
+            handle.wait()
+            handle = dist.all_reduce(input_list[rank],
+                                     group=self.ds_param_repli_group,
+                                     async_op=True)
 
         return handle, input_list[rank]
 
@@ -1229,7 +1274,7 @@ class Init(InsertPostInitMethodToModuleSubClasses):
         else:
             assert partition_buffer.numel() >= partition_size, f"The partition buffer size {partition_buffer.numel()} should match the size of param.ds_tensor {partition_size}"
 
-        rank = torch.distributed.get_rank(group=self.ds_process_group)
+        rank = dist.get_rank(group=self.ds_param_shard_group)
         start = partition_size * rank
         end = start + partition_size
 
@@ -1400,6 +1445,7 @@ class GatheredParameters:
         if self.src_rank is None:
             return
 
+        print("debug print calling from GatheredParameters.__exit__")
         handles = [
             torch.distributed.broadcast(p,
                                         self.src_rank,
