@@ -557,27 +557,7 @@ class Init(InsertPostInitMethodToModuleSubClasses):
         self.ds_param_repli_group = None
         self.ds_param_repli_size = None
         if local_shard:
-            print(f'rank {self.rank} enable local shard')
-            assert data_parallel_group is None, "data_parallel_group should be None, when local_shard is set"
-            n_devices = torch.cuda.device_count()
-            local_group_id = self.rank // n_devices
-            local_group_ranks = [
-                local_group_id * n_devices + i for i in range(n_devices)
-            ]
-
-            # create param shard group
-            self.ds_param_shard_group = dist.new_group(local_group_ranks, backend='nccl')
-            self.ds_param_shard_size = n_devices
-
-            # create ds_param replicate group
-            # assume param and gradient sharded in same group
-            nnodes = dist.get_world_size() // n_devices
-            replicate_ranks = [self.rank + n_devices * i for i in range(nnodes)]
-            self.ds_param_repli_group = dist.new_group(replicate_ranks, backend='nccl')
-            self.ds_param_repli_size = len(replicate_ranks)
-
-            self.world_size = dist.get_world_size(group=self.ds_param_shard_group)
-            assert self.world_size == n_devices
+            self._create_shard_groups(data_parallel_group)
 
         self._validate_remote_device(remote_device, config)
 
@@ -606,6 +586,39 @@ class Init(InsertPostInitMethodToModuleSubClasses):
         # cuda stream used for deallocating memory
         self.dealloc_stream = Stream()
         self.comm_stream = Stream()
+
+    def _create_shard_groups(self, data_parallel_group):
+
+        print(f'rank {self.rank} enable local shard')
+        assert data_parallel_group is None, "data_parallel_group should be None, when local_shard is set"
+
+        local_rank = os.environ["LOCAL_RANK"]
+        n_devices = torch.cuda.device_count()
+        node_rank = self.rank // n_devices
+        nnodes = dist.get_world_size() // n_devices
+        # create param shard group
+        for k in range(nnodes):
+            # for each node create the shard group
+            # all ranks must participant this process
+            offset = k * n_devices
+            shard_ranks_k = [offset + i for i in range(n_devices)]
+            shard_group_k = dist.new_group(shard_ranks_k, backend='nccl')
+            if k == node_rank:
+                self.ds_param_shard_group = shard_group_k
+                self.ds_param_shard_size = n_devices
+
+        # create ds_param replicate group
+        # assume param and gradient sharded in same group
+        for k in range(n_devices):
+            # create all groups; save the one k == local_rank
+            replicate_ranks_k = [k + g * n_devices for g in range(nnodes)]
+            replicate_group_k = dist.new_group(replicate_ranks_k, backend='nccl')
+            if k == local_rank:
+                self.ds_param_repli_group = replicate_group_k
+                self.ds_param_repli_size = len(replicate_ranks_k)
+
+        self.world_size = dist.get_world_size(group=self.ds_param_shard_group)
+        assert self.world_size == n_devices
 
     def _validate_remote_device(self, remote_device, ds_config):
         if ds_config is not None:
