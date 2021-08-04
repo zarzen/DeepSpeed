@@ -223,15 +223,6 @@ def free_param(param: Parameter) -> None:
     param.ds_status = ZeroParamStatus.NOT_AVAILABLE
 
 
-@instrument_w_nvtx
-def free_param(param: Parameter) -> None:
-    """Free underlying storage of a parameter."""
-    assert not param.ds_active_sub_modules, param.ds_summary()
-    # param.data doesn't store anything meaningful in partitioned state
-    param.data = torch.empty(0, dtype=param.dtype, device=param.device)
-    param.ds_status = ZeroParamStatus.NOT_AVAILABLE
-
-
 reuse_buffers = False
 temp_contiguous_tensor = None
 empty_buffers = {}
