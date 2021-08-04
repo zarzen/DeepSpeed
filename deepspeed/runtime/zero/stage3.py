@@ -563,6 +563,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
                 group = mpu.get_data_parallel_group()
 
             self.local_shard = os.environ.get("DS_LOCAL_SHARD")
+            print(f'rank {dist.get_rank()}, local shard {self.local_shard}')
             if self.local_shard and group is not None:
                 raise RuntimeError(
                     "Enable model-parallel and local-shard is not supported")
@@ -660,7 +661,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
         self.dp_process_group = dp_process_group
         if self.local_shard:
             # TODO: consider move the group creation to stage3.py from partition_paramters.py
-            print(f'rank {_get_global_rank()} enable local shard')
+            print(f'rank {dist.get_rank()} enable local shard')
             self.dp_process_group = module_init_ctx.ds_param_shard_group
 
         self.partition_count = dist.get_world_size(group=self.dp_process_group)

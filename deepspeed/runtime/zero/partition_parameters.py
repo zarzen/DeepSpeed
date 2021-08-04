@@ -606,6 +606,9 @@ class Init(InsertPostInitMethodToModuleSubClasses):
             if k == node_rank:
                 self.ds_param_shard_group = shard_group_k
                 self.ds_param_shard_size = n_devices
+                print(
+                    f'rank {dist.get_rank()}, local shard {dist.get_rank(group=shard_group_k)}/{dist.get_world_size(group=shard_group_k)}'
+                )
 
         # create ds_param replicate group
         # assume param and gradient sharded in same group
@@ -616,6 +619,9 @@ class Init(InsertPostInitMethodToModuleSubClasses):
             if k == local_rank:
                 self.ds_param_repli_group = replicate_group_k
                 self.ds_param_repli_size = len(replicate_ranks_k)
+                print(
+                    f'rank {dist.get_rank()}, replicate group {dist.get_rank(group=replicate_group_k)}/{dist.get_world_size(group=replicate_group_k)}'
+                )
 
         self.world_size = dist.get_world_size(group=self.ds_param_shard_group)
         assert self.world_size == n_devices

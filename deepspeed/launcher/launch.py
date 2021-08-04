@@ -71,6 +71,7 @@ def main():
     for k in current_env.keys():
         if "NCCL" in k:
             logger.info("%s %s %s", args.node_rank, k, current_env[k])
+    print('envorinment for DS_LOCAL_SHARD', current_env.get('DS_LOCAL_SHARD'))
 
     world_info = None
     assert args.world_info != "None", "must provide world info dict"
